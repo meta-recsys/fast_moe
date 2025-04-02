@@ -11,6 +11,10 @@ import triton
 from fast_moe.kernels.moe_fp8 import silu_jagged_bmm_fp8
 from fast_moe.kernels.utils import KernelType
 
+# pyre-fixme[21]: Could not find name `ProfilerActivity` in `torch.profiler`.
+from torch.profiler import profile, ProfilerActivity
+
+
 # buck2 run @mode/{opt,inplace} //fast_moe/kernels/benchmarks:silu_jagged_bmm_fp8_bench -- --fwd-only
 
 
@@ -50,6 +54,7 @@ def get_kernel(provider: str) -> KernelType:
 )
 @click.option("--dtype", type=str, default="bf16")
 @click.option("--fwd-only", is_flag=True)
+@click.option("--enable-profile", is_flag=True, default=False)
 def main(
     max_seq_len: int,
     e: int,
@@ -57,6 +62,7 @@ def main(
     n: int,
     dtype: str,
     fwd_only: bool,
+    enable_profile: bool,
 ) -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -72,7 +78,7 @@ def main(
     configs: List[triton.testing.Benchmark] = [
         triton.testing.Benchmark(
             x_names=["E"],
-            x_vals=[4, 8, 16, 32, 64, 128],
+            x_vals=[1],
             line_arg="provider",
             line_vals=["triton", "pytorch"],
             line_names=["Triton_Unfused", "Pytorch"],
@@ -126,6 +132,23 @@ def main(
             .uniform_(-1.0, 1.0)
             .requires_grad_()
         )
+
+        if enable_profile:
+            with profile(
+                # pyre-fixme[16]: Module `torch.profiler` has no attribute `ProfilerActivity`.
+                activities=[ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+            ) as prof:
+                silu_jagged_bmm_fp8(  # noqa E731
+                    max_seq_len=max_seq_len,
+                    seq_offsets=offsets,
+                    jagged=jagged,
+                    weight=weight,
+                    bias=bias,
+                    kernel=get_kernel(provider),
+                )
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
         if provider in ["triton", "pytorch"]:
             fn = lambda: silu_jagged_bmm_fp8(  # noqa E731
