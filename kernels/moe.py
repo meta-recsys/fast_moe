@@ -7,10 +7,12 @@ from typing import Optional
 import torch
 from fast_moe.kernels.pytorch.moe import (
     pytorch_index_select_jagged_bmm,
+    pytorch_index_select_jagged_bmm_3D,
     pytorch_mul_merge_k_add,
 )
 
 from fast_moe.kernels.triton.triton_moe import (
+    triton_index_select_jagged_bmm_3D_wrapper,
     triton_index_select_jagged_bmm_wrapper,
     triton_mul_merge_k_add_wrapper,
 )
@@ -97,3 +99,41 @@ def mul_merge_k_add(
             weight=weight,
             weight_index=weight_index,
         )
+
+
+def index_select_jagged_bmm_3D(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    kernel: KernelType = KernelType.PYTORCH,
+) -> torch.Tensor:
+    """
+    3D version of index_select_jagged_bmm
+    weight: [E, D_in, D_out]
+    jagged: [L, E, D_in]
+    """
+    if not is_fx_tracing():
+        assert index.ndim == 2 and index.shape[0] == jagged.shape[0]
+    if kernel == KernelType.TRITON:
+        return triton_index_select_jagged_bmm_3D_wrapper(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            index=index,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+        )
+    elif kernel == KernelType.PYTORCH:
+        return pytorch_index_select_jagged_bmm_3D(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            index=index,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported kernel {kernel}")

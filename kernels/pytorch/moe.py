@@ -77,3 +77,34 @@ def pytorch_index_select_jagged_bmm(
     ]  # list of tensors, each of shape [num_tokens_per_expert[i], N]
     # Concatenate the outputs from all experts to form the final output tensor
     return torch.cat(output_list, dim=0)  # [L*A, N]
+
+
+def pytorch_index_select_jagged_bmm_3D(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    3D version of pytorch_index_select_jagged_bmm
+    weight: [E, D_in, D_out]
+    jagged: [L, E, D_in]
+    """
+    weight = weight.permute(0, 2, 1)
+    partition_sizes: List[int] = (offsets[1:] - offsets[:-1]).tolist()
+    index = index.view(-1) // index.shape[-1]
+    jagged_list: List[torch.Tensor] = list(
+        jagged[index].contiguous().split(partition_sizes)
+    )
+    output_list: List[torch.Tensor] = [
+        F.linear(
+            jagged_list[i][:, i, :],
+            weight[i],
+            bias[i] if bias is not None else None,
+        )
+        for i in range(len(jagged_list))
+    ]
+
+    return torch.cat(output_list, dim=0)
