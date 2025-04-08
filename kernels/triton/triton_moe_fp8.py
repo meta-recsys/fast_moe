@@ -12,11 +12,14 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 
+from fast_moe.kernels.triton.triton_gemm_fp8 import grouped_gemm_fp8_rowwise_bias
+
 from fast_moe.kernels.triton.triton_quant_fp8 import (
     calculate_scale,
     triton_rowwise_quant_fp8,
     triton_transpose_rowwise_quant_fp8,
 )
+
 from fast_moe.kernels.triton.utils import (
     fast_sigmoid,
     get_bmm_configs,
@@ -24,6 +27,10 @@ from fast_moe.kernels.triton.utils import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+
+from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import quantize_fp8_row
+
+from torch.nn import functional as F
 
 
 def triton_silu_jagged_fp8(
@@ -337,8 +344,14 @@ def triton_silu_jagged_bmm_fp8(
     jagged: torch.Tensor,  # [L, K]
     weight: torch.Tensor,  # [E, K, D_out]
     bias: torch.Tensor,  # [E, D_out]
+    use_grouped_gemm: bool = True,
 ) -> torch.Tensor:
-    return SiluJaggedBmmFp8.apply(seq_offsets, max_seq_len, jagged, weight, bias)
+    if not use_grouped_gemm:
+        return SiluJaggedBmmFp8.apply(seq_offsets, max_seq_len, jagged, weight, bias)
+    else:
+        return SiluJaggedBmmFp8GroupedGemm.apply(
+            seq_offsets, max_seq_len, jagged, weight, bias
+        )
 
 
 class SiluJaggedBmmFp8(torch.autograd.Function):
@@ -436,6 +449,38 @@ class SiluJaggedBmmFp8(torch.autograd.Function):
             HAS_BIAS=True,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
+
+        return jagged_out
+
+
+class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        seq_offsets,
+        max_seq_len,
+        jagged,
+        weight,
+        bias,
+    ) -> torch.Tensor:
+        _jagged_silu = F.silu(jagged)
+        xq, x_scale = quantize_fp8_row(_jagged_silu)
+        weight = weight.view(-1, weight.shape[-1])
+        wq, w_scale = quantize_fp8_row(weight)
+        m_sizes = seq_offsets[1:] - seq_offsets[:-1]
+        m_sizes = m_sizes.to(torch.int32)
+
+        jagged_out = grouped_gemm_fp8_rowwise_bias(
+            xq,
+            wq,
+            m_sizes,
+            x_scale,
+            w_scale,
+            bias=bias,
+            _use_warp_specialization=False,
+        )
+
         return jagged_out
 
 

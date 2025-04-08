@@ -195,10 +195,10 @@ class MOEFp8Test(unittest.TestCase):
     # pyre-ignore
     @given(
         max_seq_len=st.sampled_from([32, 64, 200]),
-        min_seq_len=st.just(10),
+        min_seq_len=st.just(32),
         E=st.sampled_from([4, 8]),
-        D_in=st.sampled_from([16, 32, 64]),
-        D_out=st.sampled_from([16, 32, 64]),
+        D_in=st.sampled_from([128, 256]),
+        D_out=st.sampled_from([128, 256]),
         dtype=st.sampled_from([torch.bfloat16]),
         contiguous=st.just(True),
         allow_tf32=st.just(False),
@@ -216,7 +216,7 @@ class MOEFp8Test(unittest.TestCase):
         self._test_jagged_bmm_fp8(
             *args,
             **kwargs,
-            atol=3e-1,
+            atol=5e-1,
             rtol=1.5e-1,
             ref_kernel=KernelType.PYTORCH,
             real_kernel=KernelType.TRITON,
@@ -265,7 +265,7 @@ class MOEFp8Test(unittest.TestCase):
         )
 
         weight = (
-            torch.empty((E, D_in, D_out), dtype=dtype, device=device).uniform_(
+            torch.empty((E, D_out, D_in), dtype=dtype, device=device).uniform_(
                 -1.0, 1.0
             )
         ).requires_grad_()

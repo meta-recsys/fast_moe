@@ -58,7 +58,7 @@ def pytorch_silu_jagged_bmm(
     pytorch_bmm_weight_rowwise_quant_fp8(weight)
     partition_sizes: List[int] = (offsets[1:] - offsets[:-1]).tolist()
     jagged_list: List[torch.Tensor] = list(F.silu(jagged).split(partition_sizes))
-    weight = weight.permute(0, 2, 1)
+
     hidden_list: List[torch.Tensor] = [
         F.linear(
             jagged_list[i],
