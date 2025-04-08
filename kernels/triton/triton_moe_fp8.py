@@ -464,6 +464,8 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         weight,
         bias,
     ) -> torch.Tensor:
+        E, D_out, D_in = weight.shape
+        L = jagged.shape[0]
         _jagged_silu = F.silu(jagged)
         xq, x_scale = quantize_fp8_row(_jagged_silu)
         weight = weight.view(-1, weight.shape[-1])
@@ -481,7 +483,80 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             _use_warp_specialization=False,
         )
 
+        ctx.save_for_backward(seq_offsets, _jagged_silu, jagged, weight, bias)
+
+        ctx.L = L
+        ctx.E = E
+        ctx.D_in = D_in
+        ctx.D_out = D_out
+        ctx.max_seq_len = max_seq_len
+
         return jagged_out
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx, d_bmm_out: torch.Tensor
+    ) -> Tuple[None, None, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            offsets,
+            silu,
+            jagged,
+            weight,
+            bias,
+        ) = ctx.saved_tensors
+
+        d_jagged = torch.empty_like(jagged)
+
+        partition_sizes: List[int] = (offsets[1:] - offsets[:-1]).tolist()
+        d_bmm_split = torch.split(d_bmm_out, partition_sizes, dim=0)
+
+        # weight has been flattened to 2D in forward
+        weight = weight.view(ctx.E, ctx.D_out, ctx.D_in)
+        # after permute, weight is [E, D_in, D_out]
+        weight = weight.permute(0, 2, 1).contiguous()
+
+        output_list: List[torch.Tensor] = [
+            F.linear(
+                d_bmm_split[i],
+                weight[i],
+                None,
+            )
+            for i in range(len(partition_sizes))
+        ]
+        d_silu = torch.cat(output_list, dim=0)
+
+        silu_split = torch.split(silu.transpose(0, 1), partition_sizes, dim=1)
+        output_list: List[torch.Tensor] = [
+            F.linear(
+                silu_split[i],
+                d_bmm_split[i].transpose(0, 1),
+                None,
+            )
+            for i in range(len(partition_sizes))
+        ]
+
+        # d_weight shape is [E, D_in, D_out]
+        d_weight = torch.cat(output_list, dim=0)
+        d_weight = (
+            d_weight.view(ctx.E, ctx.D_in, ctx.D_out).permute(0, 2, 1).contiguous()
+        )
+
+        d_bias_list: List[torch.Tensor] = [
+            torch.sum(d_bmm_split[i], dim=0) for i in range(len(partition_sizes))
+        ]
+
+        d_bias = torch.cat(d_bias_list, dim=0).view(ctx.E, ctx.D_out)
+
+        torch.ops.aten.silu_backward(d_silu, silu, grad_input=d_jagged)
+
+        return (
+            None,
+            None,
+            d_jagged,
+            d_weight,
+            d_bias,
+        )
 
 
 @triton_autotune(

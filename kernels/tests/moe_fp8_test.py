@@ -220,6 +220,7 @@ class MOEFp8Test(unittest.TestCase):
             rtol=1.5e-1,
             ref_kernel=KernelType.PYTORCH,
             real_kernel=KernelType.TRITON,
+            test_backward=True,
         )
 
     def _test_jagged_bmm_fp8(
@@ -234,6 +235,7 @@ class MOEFp8Test(unittest.TestCase):
         allow_tf32: bool,
         ref_kernel: KernelType,
         real_kernel: KernelType,
+        test_backward: bool,
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
     ) -> None:
@@ -311,6 +313,22 @@ class MOEFp8Test(unittest.TestCase):
         torch.testing.assert_close(
             out_test.to(torch.float32), out_base.to(torch.float32), atol=atol, rtol=rtol
         )
+
+        if test_backward:
+            dout = torch.randn_like(out_base) * 0.01
+            out_base.backward(dout)
+            out_test.backward(dout)
+
+            for p_base, p_test in zip(
+                [jagged, weight, bias],
+                [jagged_test, weight_test, bias_test],
+            ):
+                torch.testing.assert_close(
+                    p_base.grad,
+                    p_test.grad,
+                    atol=atol,
+                    rtol=rtol,
+                )
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
