@@ -159,7 +159,7 @@ def main() -> None:
     profiler = create_profiler()
     with profiler:
         for _ in range(100):
-            silu_jagged_bmm_fp8(  # noqa E731
+            dout = silu_jagged_bmm_fp8(  # noqa E731
                 max_seq_len=max_seq_len,
                 seq_offsets=offsets,
                 jagged=jagged,
@@ -167,6 +167,10 @@ def main() -> None:
                 bias=bias,
                 kernel=get_kernel(provider),
             )
+
+            if args.mode == "bwd":
+                _d_out = torch.rand_like(dout) * 0.01
+                dout.backward(_d_out, retain_graph=True)
 
             profiler.step()
 

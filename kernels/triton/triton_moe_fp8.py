@@ -482,7 +482,6 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             bias=bias,
             _use_warp_specialization=False,
         )
-
         ctx.save_for_backward(seq_offsets, _jagged_silu, jagged, weight, bias)
 
         ctx.L = L
@@ -516,15 +515,21 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         # after permute, weight is [E, D_in, D_out]
         weight = weight.permute(0, 2, 1).contiguous()
 
-        output_list: List[torch.Tensor] = [
-            F.linear(
-                d_bmm_split[i],
-                weight[i],
-                None,
-            )
-            for i in range(len(partition_sizes))
-        ]
-        d_silu = torch.cat(output_list, dim=0)
+        weight = weight.view(-1, weight.shape[-1])
+        wq, w_scale = quantize_fp8_row(weight)
+        q_d_bmm, q_d_bmm_scale = quantize_fp8_row(d_bmm_out)
+
+        m_sizes = offsets[1:] - offsets[:-1]
+        m_sizes = m_sizes.to(torch.int32)
+        d_silu = grouped_gemm_fp8_rowwise_bias(
+            q_d_bmm,
+            wq,
+            m_sizes,
+            q_d_bmm_scale,
+            w_scale,
+            bias=None,
+            _use_warp_specialization=False,
+        )
 
         silu_split = torch.split(silu.transpose(0, 1), partition_sizes, dim=1)
         output_list: List[torch.Tensor] = [
