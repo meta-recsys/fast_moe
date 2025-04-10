@@ -92,6 +92,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="max sequence length",
     )
     parser.add_argument(
+        "--min_seq_len",
+        type=int,
+        default=256,
+        help="min sequence length",
+    )
+    parser.add_argument(
         "--e",
         type=int,
         default=1,
@@ -121,13 +127,14 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
 
     max_seq_len = args.max_seq_len
+    min_seq_len = args.min_seq_len
     E = args.e
     M = args.m
     N = args.n
-    dtype = torch.float16
+    dtype = torch.bfloat16
     provider = args.provider
 
-    lengths = torch.randint(max_seq_len + 1, size=(E,))
+    lengths = torch.randint(min_seq_len, max_seq_len + 1, size=(E,))
     offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
     lengths = lengths.to(torch.device("cuda"))
     offsets = offsets.to(torch.device("cuda"))
