@@ -9,7 +9,10 @@ import torch
 # @manual=//triton:triton
 import triton.language as tl
 
-from fast_moe.kernels.triton.utils import triton_autotune
+from fast_moe.kernels.triton.utils import (
+    _get_rowwise_quant_fp8_configs,
+    triton_autotune,
+)
 
 # @manual=//triton:triton
 from triton import Config, jit  # @manual
@@ -209,3 +212,63 @@ def calculate_scale(
     is_not_finite = is_nan | is_inf
     a_scale = tl.where(is_not_finite, 2.0**127, a_scale)
     return a_scale
+
+
+@triton_autotune(
+    configs=_get_rowwise_quant_fp8_configs(),
+    key=["D_IN", "K"],
+)
+@jit
+def _rowwise_quant_fp8_kernel(
+    weight,
+    weight_scale,
+    weight_fp8,
+    D_IN,
+    K,
+    stride_km,
+    stride_mk,
+    MAX_FP8: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    off_m = tl.program_id(0) * BLOCK_M
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    cur_col_max = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    weight_ptr = weight + off_m * stride_km + offs_m[:, None] * stride_km
+    for k in range(0, K, BLOCK_K):
+        w = tl.load(
+            weight_ptr + offs_k[None, :] + k,
+            mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
+            other=0.0,
+        )
+
+        cur_col_max = tl.maximum(tl.max(tl.abs(w.to(tl.float32)), axis=1), cur_col_max)
+
+    w_scale = calculate_scale(cur_col_max, MAX_FP8)
+
+    tl.store(
+        weight_scale + off_m + offs_m,
+        1.0 / w_scale,
+        mask=((off_m + offs_m) < D_IN),
+    )
+
+    # quantize weight to fp8
+    weight_fp8_ptr = weight_fp8 + off_m * stride_km + offs_m[:, None] * stride_km
+    for k in range(0, K, BLOCK_K):
+        w = tl.load(
+            weight_ptr + offs_k[None, :] + k,
+            mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
+            other=0.0,
+        )
+
+        w_fp8_ = w * w_scale[:, None]
+        w_fp8 = w_fp8_.to(tl.float8e4nv)
+
+        tl.store(
+            weight_fp8_ptr + offs_k[None, :] + k,
+            w_fp8,
+            mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
+        )

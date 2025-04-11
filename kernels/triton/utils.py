@@ -78,6 +78,25 @@ def get_bmm_configs() -> List[triton.Config]:
     return configs
 
 
+def _get_rowwise_quant_fp8_configs() -> List[triton.Config]:
+    configs = []
+    for BLOCK_M in [64, 128]:
+        for BLOCK_K in [32, 64]:
+            for num_stages in [2, 3]:
+                for num_warps in [4, 8]:
+                    configs.append(
+                        triton.Config(
+                            {
+                                "BLOCK_M": BLOCK_M,
+                                "BLOCK_K": BLOCK_K,
+                            },
+                            num_stages=num_stages,
+                            num_warps=num_warps,
+                        )
+                    )
+    return configs
+
+
 class TritonAutotuner(Autotuner):
     # pyre-ignore[2]
     def __init__(self, *args, **kwargs) -> None:

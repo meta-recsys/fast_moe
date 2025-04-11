@@ -15,6 +15,7 @@ import triton.language as tl
 from fast_moe.kernels.triton.triton_gemm_fp8 import grouped_gemm_fp8_rowwise_bias
 
 from fast_moe.kernels.triton.triton_quant_fp8 import (
+    _rowwise_quant_fp8_kernel,
     calculate_scale,
     triton_rowwise_quant_fp8,
     triton_transpose_rowwise_quant_fp8,
@@ -468,8 +469,29 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         L = jagged.shape[0]
         _jagged_silu = F.silu(jagged)
         xq, x_scale = quantize_fp8_row(_jagged_silu)
-        weight = weight.view(-1, weight.shape[-1])
-        wq, w_scale = quantize_fp8_row(weight)
+
+        wq = torch.empty(
+            (E * D_out, D_in), dtype=torch.float8_e4m3fn, device=weight.device
+        )
+        w_scale = torch.empty((E * D_out), dtype=torch.float32, device=weight.device)
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(E * D_out, meta["BLOCK_M"]),
+        )
+
+        MAX_FP8 = 448.0
+
+        _rowwise_quant_fp8_kernel[grid](
+            weight,
+            w_scale,
+            wq,
+            D_IN=E * D_out,
+            K=D_in,
+            stride_km=D_in,
+            stride_mk=D_out,
+            MAX_FP8=MAX_FP8,
+        )
+
         m_sizes = seq_offsets[1:] - seq_offsets[:-1]
         m_sizes = m_sizes.to(torch.int32)
 
@@ -482,7 +504,7 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             bias=bias,
             _use_warp_specialization=False,
         )
-        ctx.save_for_backward(seq_offsets, _jagged_silu, jagged, weight, bias)
+        ctx.save_for_backward(seq_offsets, _jagged_silu, m_sizes, jagged, weight, bias)
 
         ctx.L = L
         ctx.E = E
@@ -500,6 +522,7 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         (
             offsets,
             silu,
+            m_sizes,
             jagged,
             weight,
             bias,
@@ -519,8 +542,6 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         wq, w_scale = quantize_fp8_row(weight)
         q_d_bmm, q_d_bmm_scale = quantize_fp8_row(d_bmm_out)
 
-        m_sizes = offsets[1:] - offsets[:-1]
-        m_sizes = m_sizes.to(torch.int32)
         d_silu = grouped_gemm_fp8_rowwise_bias(
             q_d_bmm,
             wq,
