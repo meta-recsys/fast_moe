@@ -11,6 +11,7 @@ import triton.language as tl
 
 from fast_moe.kernels.triton.utils import (
     _get_rowwise_quant_fp8_configs,
+    fast_sigmoid,
     triton_autotune,
 )
 
@@ -226,14 +227,19 @@ def _rowwise_quant_fp8_kernel(
     D_IN,
     K,
     stride_km,
-    stride_mk,
-    MAX_FP8: tl.constexpr,
+    silu_out,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    APPLY_SILU: tl.constexpr,
 ):
+    MAX_FP8 = 448.0
+
     off_m = tl.program_id(0) * BLOCK_M
     offs_m = tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_K)
+
+    offs_m = tl.multiple_of(offs_m, BLOCK_M)
+    offs_k = tl.multiple_of(offs_k, BLOCK_K)
 
     cur_col_max = tl.zeros([BLOCK_M], dtype=tl.float32)
 
@@ -244,6 +250,17 @@ def _rowwise_quant_fp8_kernel(
             mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
             other=0.0,
         )
+
+        if APPLY_SILU:
+            w_fp32 = w.to(tl.float32)
+            w_sigmoid = fast_sigmoid(w_fp32)
+            w = (w_fp32 * w_sigmoid).to(w.dtype)
+
+            tl.store(
+                silu_out + (offs_m[:, None] + off_m) * stride_km + offs_k[None, :] + k,
+                w,
+                mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
+            )
 
         cur_col_max = tl.maximum(tl.max(tl.abs(w.to(tl.float32)), axis=1), cur_col_max)
 
@@ -258,11 +275,18 @@ def _rowwise_quant_fp8_kernel(
     # quantize weight to fp8
     weight_fp8_ptr = weight_fp8 + off_m * stride_km + offs_m[:, None] * stride_km
     for k in range(0, K, BLOCK_K):
-        w = tl.load(
-            weight_ptr + offs_k[None, :] + k,
-            mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
-            other=0.0,
-        )
+        if not APPLY_SILU:
+            w = tl.load(
+                weight_ptr + offs_k[None, :] + k,
+                mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
+                other=0.0,
+            )
+        else:
+            w = tl.load(
+                silu_out + (offs_m[:, None] + off_m) * stride_km + offs_k[None, :] + k,
+                mask=((off_m + offs_m[:, None]) < D_IN) & ((offs_k[None, :] + k) < K),
+                other=0.0,
+            )
 
         w_fp8_ = w * w_scale[:, None]
         w_fp8 = w_fp8_.to(tl.float8e4nv)

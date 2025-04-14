@@ -467,8 +467,24 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
     ) -> torch.Tensor:
         E, D_out, D_in = weight.shape
         L = jagged.shape[0]
-        _jagged_silu = F.silu(jagged)
-        xq, x_scale = quantize_fp8_row(_jagged_silu)
+
+        xq = torch.empty_like(jagged, dtype=torch.float8_e4m3fn, device=jagged.device)
+        x_scale = torch.empty(L, dtype=torch.float32, device=jagged.device)
+        _jagged_silu = torch.empty_like(jagged, dtype=jagged.dtype)
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(L, meta["BLOCK_M"]),
+        )
+
+        _rowwise_quant_fp8_kernel[grid](
+            jagged,
+            x_scale,
+            xq,
+            D_IN=L,
+            K=D_in,
+            stride_km=D_in,
+            silu_out=_jagged_silu,
+            APPLY_SILU=True,
+        )
 
         wq = torch.empty(
             (E * D_out, D_in), dtype=torch.float8_e4m3fn, device=weight.device
@@ -479,8 +495,6 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             triton.cdiv(E * D_out, meta["BLOCK_M"]),
         )
 
-        MAX_FP8 = 448.0
-
         _rowwise_quant_fp8_kernel[grid](
             weight,
             w_scale,
@@ -488,8 +502,8 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             D_IN=E * D_out,
             K=D_in,
             stride_km=D_in,
-            stride_mk=D_out,
-            MAX_FP8=MAX_FP8,
+            silu_out=None,
+            APPLY_SILU=False,
         )
 
         m_sizes = seq_offsets[1:] - seq_offsets[:-1]
