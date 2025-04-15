@@ -554,7 +554,26 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
 
         weight = weight.view(-1, weight.shape[-1])
         wq, w_scale = quantize_fp8_row(weight)
-        q_d_bmm, q_d_bmm_scale = quantize_fp8_row(d_bmm_out)
+
+        q_d_bmm = torch.empty_like(
+            d_bmm_out, dtype=torch.float8_e4m3fn, device=d_bmm_out.device
+        )
+        q_d_bmm_scale = torch.empty(
+            (ctx.L,), dtype=torch.float32, device=d_bmm_out.device
+        )
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(ctx.L, meta["BLOCK_M"]),
+        )
+        _rowwise_quant_fp8_kernel[grid](
+            d_bmm_out,
+            q_d_bmm_scale,
+            q_d_bmm,
+            D_IN=ctx.L,
+            K=ctx.D_out,
+            stride_km=ctx.D_out,
+            silu_out=None,
+            APPLY_SILU=False,
+        )
 
         d_silu = grouped_gemm_fp8_rowwise_bias(
             q_d_bmm,
