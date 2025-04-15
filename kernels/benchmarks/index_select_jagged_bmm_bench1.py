@@ -177,7 +177,7 @@ def main(provider: str, num_tokens: int, e: int, k: int, m: int, n: int) -> None
         M=m,
         N=n,
     )
-    bench = TrainModuleBench(factory)
+    bench = TrainModuleBench(factory, precision="bf16", run_backward=True)
     bench.run_benchmark()
 
 

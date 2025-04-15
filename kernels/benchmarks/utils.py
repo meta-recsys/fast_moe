@@ -15,6 +15,8 @@ from fast_moe.kernels.benchmarks.timer import (
     TimerResult,
 )
 from fast_moe.kernels.utils import KernelType
+
+from torch.cuda import nvtx
 from torch.profiler import profile
 from torch.utils.flop_counter import FlopCounterMode
 
@@ -217,6 +219,7 @@ class ModuleBench(abc.ABC):
         )
 
         with suppress_stdout_stderr():
+            nvtx_range_id = nvtx.range_start("benchmark.profile")
             profiler.start()
             for _ in range(
                 self._profiler_params.wait_cycles
@@ -225,6 +228,7 @@ class ModuleBench(abc.ABC):
             ):
                 self.run_module()
                 profiler.step()
+            nvtx.range_end(nvtx_range_id)
             profiler.stop()
 
         logger.info(
@@ -298,6 +302,7 @@ class TrainModuleBench(ModuleBench):
         precision: Optional[str] = None,
         amp_dtype: Optional[str] = None,
         pt2_config: Optional[PT2Config] = None,
+        run_backward: bool = True,
     ) -> None:
         torch.set_grad_enabled(True)
         super().__init__(
@@ -323,6 +328,7 @@ class TrainModuleBench(ModuleBench):
                 fullgraph=False,
                 options={"triton.cudagraphs": pt2_config.cudagraphs},
             )
+        self._run_backward = run_backward
 
     def benchmark_type(self) -> str:
         return "train"
@@ -334,10 +340,12 @@ class TrainModuleBench(ModuleBench):
         )  # if it is not forward, need to retain graph
         if self._amp_dtype is None:
             output = self._module_factory.run_module(func, self._module_inputs)
-            loss = output.sum()
-            loss.backward(retain_graph=retain_graph)
+            if self._run_backward:
+                loss = torch.randn_like(output)
+                output.backward(loss, retain_graph=retain_graph)
         else:
             with torch.cuda.amp.autocast(dtype=self._amp_dtype):
                 output = func(**self._module_inputs)
-                loss = output.sum()
-                loss.backward(retain_graph=retain_graph)
+                if self._run_backward:
+                    loss = output.sum()
+                    loss.backward(retain_graph=retain_graph)
