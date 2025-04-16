@@ -14,7 +14,10 @@ import triton.language as tl
 
 from fast_moe.kernels.triton.triton_gemm_fp8 import grouped_gemm_fp8_rowwise_bias
 
-from fast_moe.kernels.triton.triton_moe import _jagged_bmm_reduce_sum
+from fast_moe.kernels.triton.triton_moe import (
+    _jagged_bmm_reduce_sum,
+    _jagged_bmm_reduce_sum_bias,
+)
 
 from fast_moe.kernels.triton.triton_quant_fp8 import (
     _rowwise_quant_fp8_kernel,
@@ -520,6 +523,7 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             bias=bias,
             _use_warp_specialization=False,
         )
+
         ctx.save_for_backward(seq_offsets, _jagged_silu, m_sizes, jagged, weight, bias)
 
         ctx.L = L
@@ -546,9 +550,6 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
 
         d_jagged = torch.empty_like(jagged)
 
-        partition_sizes: List[int] = (offsets[1:] - offsets[:-1]).tolist()
-        d_bmm_split = torch.split(d_bmm_out, partition_sizes, dim=0)
-
         # weight has been flattened to 2D in forward
         weight = weight.view(ctx.E, ctx.D_out, ctx.D_in)
         # after permute, weight is [E, D_in, D_out]
@@ -566,6 +567,7 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         grid = lambda meta: (  # noqa E731
             triton.cdiv(ctx.L, meta["BLOCK_M"]),
         )
+
         _rowwise_quant_fp8_kernel[grid](
             d_bmm_out,
             q_d_bmm_scale,
@@ -587,19 +589,11 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             _use_warp_specialization=False,
         )
 
-        silu_split = torch.split(silu.transpose(0, 1), partition_sizes, dim=1)
-        output_list: List[torch.Tensor] = [
-            F.linear(
-                silu_split[i],
-                d_bmm_split[i].transpose(0, 1),
-                None,
-            )
-            for i in range(len(partition_sizes))
-        ]
-
         # d_weight shape is [E, D_in, D_out]
         d_weight = torch.empty(
-            (ctx.E, ctx.D_in, ctx.D_out), dtype=weight.dtype, device=weight.device
+            (ctx.E, ctx.D_out, ctx.D_in),
+            dtype=weight.dtype,
+            device=weight.device,
         )
         d_bias = torch.empty_like(bias, dtype=bias.dtype, device=bias.device)
         grid = lambda meta: (  # noqa E731
@@ -607,12 +601,12 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             triton.cdiv(ctx.D_in, meta["BLOCK_M"]),
             triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
         )
+
         _jagged_bmm_reduce_sum[grid](
             seq_offsets=offsets,
             JaggedA=silu,
             JaggedB=d_bmm_out,
             Out=d_weight,
-            ReduceOut=d_bias,
             M=ctx.D_in,
             N=ctx.D_out,
             AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
@@ -626,7 +620,22 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             REDUCE_JAGGEDB=True,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
-        d_weight = d_weight.permute(0, 2, 1).contiguous()
+
+        grid = lambda meta: (  # noqa E731
+            ctx.E,
+            triton.cdiv(ctx.D_out, meta["BLOCK_M"]),
+        )
+
+        _jagged_bmm_reduce_sum_bias[grid](
+            seq_offsets=offsets,
+            Jagged=d_bmm_out,
+            ReduceOut=d_bias,
+            M=ctx.D_out,
+            N=ctx.L,
+            stride_jm=d_bmm_out.stride(1),
+            stride_jn=d_bmm_out.stride(0),
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
 
         torch.ops.aten.silu_backward(d_silu, silu, grad_input=d_jagged)
 

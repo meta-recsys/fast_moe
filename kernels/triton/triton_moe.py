@@ -1390,7 +1390,6 @@ def _jagged_bmm_reduce_sum(
     JaggedA,
     JaggedB,
     Out,
-    ReduceOut,
     M,
     N,
     AUTOTUNE_MAX_SEQ_LEN,
@@ -1428,25 +1427,14 @@ def _jagged_bmm_reduce_sum(
     Out += off_b.to(tl.int64) * stride_ob
     offs_m = start_m + tl.arange(0, BLOCK_M)
     offs_n = start_n + tl.arange(0, BLOCK_N)
-    out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-    if REDUCE_JAGGEDB:
-        out_reduce_ptrs = ReduceOut + off_b * stride_orb + offs_n * stride_orn
-        acc_reduce = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    if seq_len == 0:
-        out = accumulator.to(Out.dtype.element_ty)
-        tl.store(out_ptrs, out, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-        if REDUCE_JAGGEDB:
-            if off_m == 0:
-                tl.store(
-                    out_reduce_ptrs,  # pyre-ignore [61]
-                    acc_reduce.to(ReduceOut.dtype.element_ty),
-                    mask=(offs_n < N),
-                )
-        return
+    out_ptrs = Out + offs_m[None, :] * stride_on + offs_n[:, None] * stride_om
 
     JaggedA += seq_start * stride_ak
     JaggedB += seq_start * stride_bk
     offs_k = tl.arange(0, BLOCK_K)
+    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+    offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
     jg_a_ptrs = JaggedA + offs_k[None, :] * stride_ak + offs_m[:, None]
     jg_b_ptrs = JaggedB + offs_k[:, None] * stride_bk + offs_n[None, :]
 
@@ -1464,19 +1452,82 @@ def _jagged_bmm_reduce_sum(
         )
 
         accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
-        if REDUCE_JAGGEDB:
-            if off_m == 0:
-                acc_reduce += tl.sum(jg_b.to(tl.float32), axis=0)
 
         jg_a_ptrs += BLOCK_K * stride_ak
         jg_b_ptrs += BLOCK_K * stride_bk
 
     out = accumulator.to(Out.dtype.element_ty)
-    tl.store(out_ptrs, out, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-    if REDUCE_JAGGEDB:
-        if off_m == 0:
-            tl.store(
-                out_reduce_ptrs,  # pyre-ignore [61]
-                acc_reduce.to(ReduceOut.dtype.element_ty),
-                mask=(offs_n < N),
-            )
+    tl.store(out_ptrs, out.T, mask=(offs_n[:, None] < N) & (offs_m[None, :] < M))
+
+
+@triton_autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": BLOCK_M,
+                "BLOCK_N": BLOCK_N,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_M in [32, 64, 128]
+        for BLOCK_N in [32, 64, 128]
+        for num_stages in [2, 3]
+        for num_warps in [4, 8]
+    ],
+    key=["M", "N"],
+)
+@triton.jit
+def _jagged_bmm_reduce_sum_bias(
+    seq_offsets,
+    Jagged,
+    ReduceOut,
+    M,
+    N,
+    stride_jm,
+    stride_jn,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    off_b = tl.program_id(0)
+    off_m = tl.program_id(1)
+
+    seq_start = tl.load(seq_offsets + off_b)
+    seq_end = tl.load(seq_offsets + off_b + 1)
+    seq_len = seq_end - seq_start
+
+    start_m = off_m * BLOCK_M
+
+    accum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+    jg_ptrs = (
+        Jagged
+        + seq_start.to(tl.int64) * stride_jn
+        + offs_m.to(tl.int64)[:, None] * stride_jm
+        + offs_n[None, :].to(tl.int64) * stride_jn,
+    )
+
+    out_reduce_ptrs = ReduceOut + off_b * M + offs_m
+
+    for k in range(0, seq_len, BLOCK_N):
+        jg = tl.load(
+            jg_ptrs,
+            mask=(offs_m[:, None] < M) and ((offs_n[None, :] + k) < seq_len),
+            other=0.0,
+        )
+
+        accum += jg
+        jg_ptrs += BLOCK_N * stride_jn
+
+    _accum = tl.sum(accum, axis=1)
+    out = _accum.to(ReduceOut.dtype.element_ty)
+
+    tl.store(out_reduce_ptrs, out, mask=(offs_m[:] < M))
