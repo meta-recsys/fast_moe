@@ -14,6 +14,8 @@ import triton.language as tl
 
 from fast_moe.kernels.triton.triton_gemm_fp8 import grouped_gemm_fp8_rowwise_bias
 
+from fast_moe.kernels.triton.triton_moe import _jagged_bmm_reduce_sum
+
 from fast_moe.kernels.triton.triton_quant_fp8 import (
     _rowwise_quant_fp8_kernel,
     calculate_scale,
@@ -596,16 +598,35 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
         ]
 
         # d_weight shape is [E, D_in, D_out]
-        d_weight = torch.cat(output_list, dim=0)
-        d_weight = (
-            d_weight.view(ctx.E, ctx.D_in, ctx.D_out).permute(0, 2, 1).contiguous()
+        d_weight = torch.empty(
+            (ctx.E, ctx.D_in, ctx.D_out), dtype=weight.dtype, device=weight.device
         )
-
-        d_bias_list: List[torch.Tensor] = [
-            torch.sum(d_bmm_split[i], dim=0) for i in range(len(partition_sizes))
-        ]
-
-        d_bias = torch.cat(d_bias_list, dim=0).view(ctx.E, ctx.D_out)
+        d_bias = torch.empty_like(bias, dtype=bias.dtype, device=bias.device)
+        grid = lambda meta: (  # noqa E731
+            ctx.E,
+            triton.cdiv(ctx.D_in, meta["BLOCK_M"]),
+            triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
+        )
+        _jagged_bmm_reduce_sum[grid](
+            seq_offsets=offsets,
+            JaggedA=silu,
+            JaggedB=d_bmm_out,
+            Out=d_weight,
+            ReduceOut=d_bias,
+            M=ctx.D_in,
+            N=ctx.D_out,
+            AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+            stride_ak=silu.stride(0),
+            stride_bk=d_bmm_out.stride(0),
+            stride_ob=d_weight.stride(0),
+            stride_om=d_weight.stride(1),
+            stride_on=d_weight.stride(2),
+            stride_orb=d_bias.stride(0),
+            stride_orn=d_bias.stride(1),
+            REDUCE_JAGGEDB=True,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+        d_weight = d_weight.permute(0, 2, 1).contiguous()
 
         torch.ops.aten.silu_backward(d_silu, silu, grad_input=d_jagged)
 
