@@ -33,16 +33,20 @@ def _get_transpose_configs() -> List[triton.Config]:
 
 @triton_autotune(
     configs=_get_transpose_configs(),
-    key=["M", "N", "HAS_INDEX"],
+    key=["AUTOTUNE_M", "AUTOTUNE_N", "HAS_INDEX"],
 )
 @triton.jit
 def _kernel_index_transpose(
-    A,
-    AT,
+    IN,
+    OUT,
     M,
     N,
+    AUTOTUNE_M,
+    AUTOTUNE_N,
     INDEX,
     HAS_INDEX: tl.constexpr,
+    stride_om,
+    stride_on,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -58,46 +62,69 @@ def _kernel_index_transpose(
     if HAS_INDEX:
         m_offsets = tl.load(INDEX + rm, mask=rm < M, other=0)  # [BLOCK_M]
     else:
-        m_offsets = rm  # [BLOCK_M, 1]
-    a_offset = m_offsets[:, None] * N + rn[None, :] * 1  # [BLOCK_M, BLOCK_N]
-    at_offset = rm[:, None] * 1 + rn[None, :] * M  # [BLOCK_M, BLOCK_N]
+        m_offsets = rm  # [BLOCK_M]
+    in_offset = m_offsets[:, None].to(tl.int64) * N + rn[None, :]  # [BLOCK_M, BLOCK_N]
+    out_offset = (
+        rm[:, None].to(tl.int64) * stride_om + rn[None, :].to(tl.int64) * stride_on
+    )  # [BLOCK_M, BLOCK_N]
     mask = (rm < M)[:, None] & (rn < N)[None, :]  # [BLOCK_M, BLOCK_N]
-    # TODO handle edge case with masks.
-    a = tl.load(A + a_offset, mask=mask)
-    tl.store(AT + at_offset, a, mask=mask)
+    data = tl.load(IN + in_offset, mask=mask)
+    tl.store(OUT + out_offset, data, mask=mask)
 
 
 def triton_transpose(x):
     return triton_index_transpose(x, None)
 
 
-def triton_index_transpose(x, index: Optional[torch.Tensor] = None):
+def triton_index_select(x, index: torch.Tensor):
+    return triton_index_transpose(x, index, transpose=False)
+
+
+def triton_index_transpose(
+    input, index: Optional[torch.Tensor] = None, transpose: bool = True
+):
     """
-    Transpose a jagged tensor with index. output = x[index].T.contiguous()
+    Transpose a jagged tensor with index. output = input[index].T.contiguous()
     Args:
-        x: [?, N] input tensor
+        input: [?, N] input tensor
         index: [M] tensor
+        transpose: whether to transpose the output tensor
     Returns:
         output: [N, M] tensor
     """
-    assert x.is_contiguous()
+    assert input.is_contiguous()
 
     has_index = False
     if index is not None:
         has_index = True
         assert index.is_contiguous()
         M = index.shape[0]
-        _, N = x.shape
+        _, N = input.shape
     else:
-        M, N = x.shape
+        M, N = input.shape
 
-    output = torch.empty(N, M, dtype=x.dtype, device=x.device)
+    if transpose:
+        output = torch.empty(N, M, dtype=input.dtype, device=input.device)
+        stride_on, stride_om = output.stride()
+    else:
+        output = torch.empty(M, N, dtype=input.dtype, device=input.device)
+        stride_om, stride_on = output.stride()
 
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
 
-    # TODO: next_power_of_2
-    _kernel_index_transpose[grid](x, output, M, N, INDEX=index, HAS_INDEX=has_index)
+    _kernel_index_transpose[grid](
+        input,
+        output,
+        M,
+        N,
+        triton.next_power_of_2(M),
+        triton.next_power_of_2(N),
+        INDEX=index,
+        HAS_INDEX=has_index,
+        stride_om=stride_om,
+        stride_on=stride_on,
+    )
     return output
 
 
