@@ -43,7 +43,7 @@ class MOETest(unittest.TestCase):
         deadline=None,
     )
     # pyre-ignore[2]
-    def test_index_select_jagged_bmm_triton(self, *args, **kwargs) -> None:
+    def test_index_select_jagged_bmm_triton_d_jagged(self, *args, **kwargs) -> None:
         for gemm_out_type in [torch.float32, torch.bfloat16]:
             if (
                 torch.cuda.get_device_capability(torch.device("cuda"))[0] < 8
@@ -71,6 +71,46 @@ class MOETest(unittest.TestCase):
                     real_kernel=KernelType.TRITON,
                     test_triton_option=triton_option,
                 )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        L=st.sampled_from([16, 32, 100, 500]),
+        E=st.sampled_from([4, 8, 16]),
+        K=st.sampled_from([2, 4]),
+        D_in=st.sampled_from([32, 64]),
+        D_out=st.sampled_from([64, 128]),
+        dtype=st.sampled_from(
+            [torch.float32, torch.bfloat16]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+        d_weight_optimize=st.booleans(),
+        contiguous=st.booleans(),
+        has_bias=st.booleans(),
+        allow_tf32=st.sampled_from([False]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_index_select_jagged_bmm_triton_d_weight(self, *args, **kwargs) -> None:
+        d_weight_optimize = kwargs.pop("d_weight_optimize")
+        triton_option = IndexSelectJaggedBmmOption(
+            d_weight_optimization=d_weight_optimize
+        )
+        self._test_index_select_jagged_bmm(
+            *args,
+            **kwargs,
+            test_backward=True,
+            atol=None,
+            rtol=None,
+            ref_kernel=KernelType.PYTORCH,
+            real_kernel=KernelType.TRITON,
+            test_triton_option=triton_option,
+        )
 
     # pyre-ignore[2]
     def test_index_select_jagged_bmm_big_shape_triton(self, *args, **kwargs) -> None:

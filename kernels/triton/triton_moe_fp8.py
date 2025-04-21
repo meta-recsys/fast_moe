@@ -14,10 +14,7 @@ import triton.language as tl
 
 from fast_moe.kernels.triton.triton_gemm_fp8 import grouped_gemm_fp8_rowwise_bias
 
-from fast_moe.kernels.triton.triton_moe import (
-    _jagged_bmm_reduce_sum,
-    _jagged_bmm_reduce_sum_bias,
-)
+from fast_moe.kernels.triton.triton_moe import _jagged_jagged_bmm, _jagged_reduce_sum
 
 from fast_moe.kernels.triton.triton_quant_fp8 import (
     _rowwise_quant_fp8_kernel,
@@ -35,8 +32,6 @@ from fast_moe.kernels.triton.utils import (
 )
 
 from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import quantize_fp8_row
-
-from torch.nn import functional as F
 
 
 def triton_silu_jagged_fp8(
@@ -602,22 +597,19 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
         )
 
-        _jagged_bmm_reduce_sum[grid](
+        _jagged_jagged_bmm[grid](
             seq_offsets=offsets,
             JaggedA=silu,
             JaggedB=d_bmm_out,
             Out=d_weight,
             M=ctx.D_in,
             N=ctx.D_out,
-            AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+            AUTOTUNE_K=triton.next_power_of_2(ctx.max_seq_len),
             stride_ak=silu.stride(0),
             stride_bk=d_bmm_out.stride(0),
             stride_ob=d_weight.stride(0),
             stride_om=d_weight.stride(1),
             stride_on=d_weight.stride(2),
-            stride_orb=d_bias.stride(0),
-            stride_orn=d_bias.stride(1),
-            REDUCE_JAGGEDB=True,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
 
@@ -626,7 +618,7 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
             triton.cdiv(ctx.D_out, meta["BLOCK_M"]),
         )
 
-        _jagged_bmm_reduce_sum_bias[grid](
+        _jagged_reduce_sum[grid](
             seq_offsets=offsets,
             Jagged=d_bmm_out,
             ReduceOut=d_bias,
@@ -1118,83 +1110,6 @@ def _indexed_jagged_jagged_bmm(
     )
 
 
-@triton_autotune(
-    configs=[
-        triton.Config(
-            {
-                "BLOCK_N": BLOCK_N,
-                "BLOCK_K": BLOCK_K,
-            },
-            num_stages=num_stages,
-            num_warps=num_warps,
-        )
-        for BLOCK_N in [32, 64]
-        for BLOCK_K in [64, 128]
-        for num_stages in [2, 3]
-        for num_warps in [4, 8]
-    ],
-    key=["N", "K"],
-)
-@triton.jit
-def _jagged_reduce_sum(
-    seq_offsets,
-    JaggedB,
-    ReduceOut,
-    N,
-    K,
-    stride_bk,
-    stride_orb,
-    stride_orn,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    off_b = tl.program_id(0)
-    off_n = tl.program_id(1)
-
-    seq_start = tl.load(seq_offsets + off_b)
-    seq_end = tl.load(seq_offsets + off_b + 1)
-    seq_len = seq_end - seq_start
-
-    start_n = off_n * BLOCK_N
-
-    offs_n = start_n + tl.arange(0, BLOCK_N)
-
-    out_reduce_ptrs = ReduceOut + off_b * stride_orb + offs_n * stride_orn
-    acc_reduce = tl.zeros((BLOCK_N,), dtype=tl.float32)
-
-    if seq_len == 0:
-        tl.store(
-            out_reduce_ptrs,
-            acc_reduce.to(ReduceOut.dtype.element_ty),
-            mask=(offs_n < N),
-        )
-        return
-
-    offs_k = tl.arange(0, BLOCK_K)
-
-    JaggedB += seq_start.to(tl.int64) * stride_bk
-
-    jg_b_ptrs = JaggedB + offs_k[:, None].to(tl.int64) * stride_bk + offs_n[None, :]
-
-    for k in range(0, seq_len, BLOCK_K):
-        jg_b = tl.load(
-            jg_b_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
-            mask=(offs_n[None, :] < N) and ((k + offs_k)[:, None] < seq_len),
-            other=0.0,
-        )
-
-        acc_reduce += tl.sum(jg_b, axis=0)
-
-        jg_b_ptrs += BLOCK_K * stride_bk
-
-    tl.store(
-        out_reduce_ptrs,
-        acc_reduce.to(ReduceOut.dtype.element_ty),
-        mask=(offs_n < N),
-    )
-
-
 class IndexSelectJaggedBmm(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -1403,23 +1318,15 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
             )
             _jagged_reduce_sum[grid](
                 seq_offsets=offsets,
-                JaggedB=d_out,
+                Jagged=d_out,
                 ReduceOut=d_bias,
-                N=N,
-                # K is only used for triggering autotune
-                K=triton.next_power_of_2(ctx.max_seq_len),
-                stride_bk=d_out.stride(0),
-                stride_orb=d_bias.stride(0),
-                stride_orn=d_bias.stride(1),
+                M=N,
+                # N is only used for triggering autotune
+                N=triton.next_power_of_2(ctx.max_seq_len),
+                stride_jm=d_out.stride(1),
+                stride_jn=d_out.stride(0),
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
             )
-            """
-            for i in range(E):
-                d_bias[i] = (
-                    d_out[offsets[i] : offsets[i + 1]]
-                    .sum(dim=0, dtype=torch.float32)
-                    .to(d_bias.dtype)
-                )
-            """
         else:
             d_bias = None
 

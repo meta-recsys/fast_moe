@@ -13,7 +13,10 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from fast_moe.kernels.triton.grouped_gemm import grouped_gemm
-from fast_moe.kernels.triton.triton_general_ops import triton_sum_dim1
+from fast_moe.kernels.triton.triton_general_ops import (
+    triton_index_select,
+    triton_sum_dim1,
+)
 from fast_moe.kernels.triton.utils import (
     get_bmm_configs,
     switch_to_contiguous_if_needed,
@@ -26,6 +29,7 @@ from torch.autograd.profiler import record_function
 class IndexSelectJaggedBmmOption:
     d_jagged_use_grouped_gemm: bool = True
     d_jagged_gemm_out_type: torch.dtype = torch.float32
+    d_weight_optimization: bool = True
 
 
 @torch.fx.wrap
@@ -530,7 +534,17 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
 
         with record_function("#### d_weight ####"):
             d_weight, d_bias = IndexSelectJaggedBmm._calc_d_weight_bias(
-                weight, bias, offsets, index, d_out, jagged, E, K, N, max_seq_len
+                weight,
+                bias,
+                offsets,
+                index,
+                d_out,
+                jagged,
+                E,
+                K,
+                N,
+                max_seq_len,
+                option,
             )
 
         return (
@@ -616,44 +630,56 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         K: int,
         N: int,
         max_seq_len: int,
+        option: IndexSelectJaggedBmmOption,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        has_bias = False
-        # tensors below needs to be initialized with zeros as there could be unused
-        # rows in the weight and bias
-        d_weight = torch.zeros_like(weight)  # [E, K, N]
-        if bias is not None:
-            has_bias = True
-            d_bias = torch.zeros_like(bias)  # [E, N]
-            stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
+        if option.d_weight_optimization:
+            jagged_a = triton_index_select(
+                jagged, index.flatten() // index.shape[1]
+            )  # [L * A, K]
+            d_weight, d_bias = triton_jagged_bmm_reduce_sum(
+                JaggedA=jagged_a,  # [L * A, K]
+                JaggedB=d_out,  # [L * A, N]
+                offsets=offsets,  # [E + 1]
+                reduce_sum=bias is not None,
+            )  # [E, K, N], [E, N]
         else:
-            d_bias = None
-            stride_orb, stride_orn = 0, 0
-        grid = lambda meta: (  # noqa E731
-            E,
-            triton.cdiv(K, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
-        _indexed_jagged_jagged_bmm_reduce_sum[grid](
-            seq_offsets=offsets,
-            Index=index.view(-1) // index.shape[1],
-            JaggedA=jagged,
-            JaggedB=d_out,
-            Out=d_weight,
-            ReduceOut=d_bias,
-            M=K,
-            N=N,
-            # K is only used for triggering autotune
-            K=triton.next_power_of_2(max_seq_len),
-            stride_ak=jagged.stride(0),
-            stride_bk=d_out.stride(0),
-            stride_ob=d_weight.stride(0),
-            stride_om=d_weight.stride(1),
-            stride_on=d_weight.stride(2),
-            stride_orb=stride_orb,
-            stride_orn=stride_orn,
-            REDUCE_JAGGEDB=has_bias,
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
+            has_bias = False
+            # tensors below needs to be initialized with zeros as there could be unused
+            # rows in the weight and bias
+            d_weight = torch.zeros_like(weight)  # [E, K, N]
+            if bias is not None:
+                has_bias = True
+                d_bias = torch.zeros_like(bias)  # [E, N]
+                stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
+            else:
+                d_bias = None
+                stride_orb, stride_orn = 0, 0
+            grid = lambda meta: (  # noqa E731
+                E,
+                triton.cdiv(K, meta["BLOCK_M"]),
+                triton.cdiv(N, meta["BLOCK_N"]),
+            )
+            _indexed_jagged_jagged_bmm_reduce_sum[grid](
+                seq_offsets=offsets,
+                Index=index.view(-1) // index.shape[1],
+                JaggedA=jagged,
+                JaggedB=d_out,
+                Out=d_weight,
+                ReduceOut=d_bias,
+                M=K,
+                N=N,
+                # K is only used for triggering autotune
+                K=triton.next_power_of_2(max_seq_len),
+                stride_ak=jagged.stride(0),
+                stride_bk=d_out.stride(0),
+                stride_ob=d_weight.stride(0),
+                stride_om=d_weight.stride(1),
+                stride_on=d_weight.stride(2),
+                stride_orb=stride_orb,
+                stride_orn=stride_orn,
+                REDUCE_JAGGEDB=has_bias,
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            )
         return d_weight, d_bias
 
 
@@ -1426,25 +1452,22 @@ def _index_select_jagged_bmm_3D(
 
 @triton_autotune(
     configs=get_bmm_configs(),
-    key=["M", "N", "AUTOTUNE_MAX_SEQ_LEN"],
+    key=["M", "N", "AUTOTUNE_K"],
 )
 @triton.jit
-def _jagged_bmm_reduce_sum(
+def _jagged_jagged_bmm(
     seq_offsets,
     JaggedA,
     JaggedB,
     Out,
     M,
     N,
-    AUTOTUNE_MAX_SEQ_LEN,
+    AUTOTUNE_K,
     stride_ak,
     stride_bk,
     stride_ob,
     stride_om,
     stride_on,
-    stride_orb,
-    stride_orn,
-    REDUCE_JAGGEDB: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1522,7 +1545,7 @@ def _jagged_bmm_reduce_sum(
     key=["M", "N"],
 )
 @triton.jit
-def _jagged_bmm_reduce_sum_bias(
+def _jagged_reduce_sum(
     seq_offsets,
     Jagged,
     ReduceOut,
@@ -1575,3 +1598,57 @@ def _jagged_bmm_reduce_sum_bias(
     out = _accum.to(ReduceOut.dtype.element_ty)
 
     tl.store(out_reduce_ptrs, out, mask=(offs_m[:] < M))
+
+
+def triton_jagged_bmm_reduce_sum(
+    JaggedA: torch.Tensor,  # (sum_B(K_i), M)
+    JaggedB: torch.Tensor,  # (sum_B(K_i), N)
+    offsets: torch.Tensor,  # (B+1)
+    reduce_sum: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # d_weight: (B, M, N), d_bias: (B, N)
+    dtype = JaggedA.dtype
+    device = JaggedA.device
+    B = offsets.shape[0] - 1
+    M = JaggedA.shape[1]
+    N = JaggedB.shape[1]
+    d_weight = torch.empty((B, M, N), dtype=dtype, device=device)
+    grid = lambda meta: (  # noqa E731
+        B,
+        triton.cdiv(M, meta["BLOCK_M"]),
+        triton.cdiv(N, meta["BLOCK_N"]),
+    )
+    _jagged_jagged_bmm[grid](
+        seq_offsets=offsets,
+        JaggedA=JaggedA,
+        JaggedB=JaggedB,
+        Out=d_weight,
+        M=M,
+        N=N,
+        # To avoid use max_seq_len here, we use total seq length as the max_seq_len
+        AUTOTUNE_K=triton.next_power_of_2(JaggedA.shape[0]),
+        stride_ak=JaggedA.stride(0),
+        stride_bk=JaggedB.stride(0),
+        stride_ob=d_weight.stride(0),
+        stride_om=d_weight.stride(2),
+        stride_on=d_weight.stride(1),
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+    )
+
+    d_bias = None
+    if reduce_sum:
+        d_bias = torch.empty((B, N), dtype=dtype, device=device)
+        grid = lambda meta: (  # noqa E731
+            B,
+            triton.cdiv(N, meta["BLOCK_M"]),
+        )
+        _jagged_reduce_sum[grid](
+            seq_offsets=offsets,
+            Jagged=JaggedB,
+            ReduceOut=d_bias,
+            M=N,
+            N=triton.next_power_of_2(JaggedB.shape[0]),
+            stride_jm=JaggedB.stride(1),
+            stride_jn=JaggedB.stride(0),
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+    return d_weight, d_bias
