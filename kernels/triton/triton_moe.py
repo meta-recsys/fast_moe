@@ -2,6 +2,7 @@
 
 # pyre-unsafe
 
+import dataclasses
 from typing import List, Optional, Tuple
 
 import torch
@@ -11,13 +12,20 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-
+from fast_moe.kernels.triton.grouped_gemm import grouped_gemm
+from fast_moe.kernels.triton.triton_general_ops import triton_sum_dim1
 from fast_moe.kernels.triton.utils import (
     get_bmm_configs,
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
 from torch.autograd.profiler import record_function
+
+
+@dataclasses.dataclass
+class IndexSelectJaggedBmmOption:
+    d_jagged_use_grouped_gemm: bool = True
+    d_jagged_gemm_out_type: torch.dtype = torch.float32
 
 
 @torch.fx.wrap
@@ -28,8 +36,11 @@ def triton_index_select_jagged_bmm(
     jagged: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    option: Optional[IndexSelectJaggedBmmOption] = None,
 ) -> torch.Tensor:
-    return IndexSelectJaggedBmm.apply(max_seq_len, offsets, index, jagged, weight, bias)
+    return IndexSelectJaggedBmm.apply(
+        max_seq_len, offsets, index, jagged, weight, bias, option
+    )
 
 
 def triton_index_select_jagged_bmm_wrapper(
@@ -39,6 +50,7 @@ def triton_index_select_jagged_bmm_wrapper(
     jagged: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    option: Optional[IndexSelectJaggedBmmOption] = None,
 ) -> torch.Tensor:
     return triton_index_select_jagged_bmm(
         max_seq_len=max_seq_len,
@@ -47,6 +59,7 @@ def triton_index_select_jagged_bmm_wrapper(
         jagged=jagged,
         weight=weight,
         bias=bias,
+        option=option,
     )
 
 
@@ -401,6 +414,7 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         jagged: torch.Tensor,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
+        option: Optional[IndexSelectJaggedBmmOption],
     ) -> torch.Tensor:
         """
         Args:
@@ -413,6 +427,9 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         Returns:
             torch.Tensor: A tensor of shape [L * A, N] containing the output after applying the linear transformation.
         """
+        if option is None:
+            option = IndexSelectJaggedBmmOption()
+
         index = switch_to_contiguous_if_needed(index)
         jagged = switch_to_contiguous_if_needed(jagged)
         if bias is not None:
@@ -459,10 +476,13 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         )
 
         ctx.save_for_backward(offsets, index, jagged, weight, bias)
+        ctx.L = L
         ctx.E = E
+        ctx.A = A
         ctx.max_seq_len = max_seq_len
         ctx.K = K
         ctx.N = N
+        ctx.option = option
 
         return output
 
@@ -478,6 +498,7 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         Optional[torch.Tensor],
+        None,
     ]:
         """
         Args:
@@ -490,6 +511,7 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
                 - torch.Tensor: Gradient with respect to `jagged`, of shape [L, K].
                 - torch.Tensor: Gradient with respect to `weight`, of shape [E, K, N].
                 - torch.Tensor: Gradient with respect to `bias`, of shape [E, N].
+                - None: No gradient is computed for `option`.
         """
         # offsets: [E + 1]
         # index: [L, A]
@@ -497,12 +519,13 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         # weight: [E, K, N]
         # bias: [E, N]
         offsets, index, jagged, weight, bias = ctx.saved_tensors
-        E, K, N = ctx.E, ctx.K, ctx.N
+        L, E, A, K, N = ctx.L, ctx.E, ctx.A, ctx.K, ctx.N
         max_seq_len = ctx.max_seq_len
+        option: IndexSelectJaggedBmmOption = ctx.option
 
         with record_function("#### d_jagged ####"):
             d_jagged = IndexSelectJaggedBmm._calc_d_jagged(
-                jagged, max_seq_len, index, E, K, N, weight, d_out, offsets
+                weight, d_out, index, offsets, L, E, A, K, N, max_seq_len, option
             )
 
         with record_function("#### d_weight ####"):
@@ -517,48 +540,69 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
             d_jagged,
             d_weight,
             d_bias,
+            None,
         )
 
     @staticmethod
     def _calc_d_jagged(
-        jagged: torch.Tensor,
-        max_seq_len: int,
-        index: torch.Tensor,
-        E,
-        K,
-        N,
         weight: torch.Tensor,
         d_out: torch.Tensor,
+        index: torch.Tensor,
         offsets: torch.Tensor,
+        L: int,
+        E: int,
+        A: int,
+        K: int,
+        N: int,
+        max_seq_len: int,
+        option: IndexSelectJaggedBmmOption,
     ) -> torch.Tensor:
-        d_jagged_expanded = torch.empty(
-            (jagged.shape[0], index.shape[1], jagged.shape[1]),
-            device=jagged.device,
-            dtype=torch.float32,
-        )  # [L, A, K]
-        grid = lambda meta: (  # noqa E731
-            triton.cdiv(max_seq_len, meta["BLOCK_M"]),
-            E,
-            triton.cdiv(K, meta["BLOCK_N"]),
-        )
-        _jagged_bmm_index_add[grid](
-            seq_offsets=offsets,
-            Index=index,
-            Jagged=d_out,
-            Dense=weight,
-            Out=d_jagged_expanded,
-            # M is only used for triggering autotune
-            M=triton.next_power_of_2(max_seq_len),
-            N=K,
-            K=N,
-            stride_jm=d_out.stride(0),
-            stride_db=weight.stride(0),
-            stride_dk=weight.stride(2),
-            stride_dn=weight.stride(1),
-            stride_om=d_jagged_expanded.stride(1),
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
-        return d_jagged_expanded.sum(dim=1).to(jagged.dtype)  # sum over A dimension
+        if option.d_jagged_use_grouped_gemm:
+            assert N % 64 == 0, "N must be a multiple of 64"
+            m_sizes = (offsets[1:] - offsets[:-1]).to(torch.int32)  # [E]
+            weight_grouped = weight.reshape(-1, N)  # [E, K, N] -> [E * K, N]
+            d_jagged_expanded = grouped_gemm(
+                x=d_out,  # [L * A, N]
+                w=weight_grouped,  # [E * K, N]
+                m_sizes=m_sizes,  # [E]
+                use_fast_accum=False,
+                allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                _use_warp_specialization=True,
+                _out_type=option.d_jagged_gemm_out_type,
+                _out_index=index.flatten(),
+            )  # [L * A, K]
+            d_jagged_expanded = d_jagged_expanded.view((L, A, K))  # [L, A, K]
+            assert d_jagged_expanded.dtype == option.d_jagged_gemm_out_type
+        else:
+            d_jagged_expanded = torch.empty(
+                (L, A, K),
+                device=d_out.device,
+                dtype=option.d_jagged_gemm_out_type,
+            )  # [L, A, K]
+            grid = lambda meta: (  # noqa E731
+                triton.cdiv(max_seq_len, meta["BLOCK_M"]),
+                E,
+                triton.cdiv(K, meta["BLOCK_N"]),
+            )
+            _jagged_bmm_index_add[grid](
+                seq_offsets=offsets,
+                Index=index,
+                Jagged=d_out,
+                Dense=weight,
+                Out=d_jagged_expanded,
+                # M is only used for triggering autotune
+                M=triton.next_power_of_2(max_seq_len),
+                N=K,
+                K=N,
+                stride_jm=d_out.stride(0),
+                stride_db=weight.stride(0),
+                stride_dk=weight.stride(2),
+                stride_dn=weight.stride(1),
+                stride_om=d_jagged_expanded.stride(1),
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            )
+        d_jagged = triton_sum_dim1(d_jagged_expanded)
+        return d_jagged
 
     @staticmethod
     def _calc_d_weight_bias(

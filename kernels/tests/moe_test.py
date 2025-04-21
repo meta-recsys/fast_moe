@@ -6,6 +6,7 @@ import unittest
 from typing import Optional
 
 import torch
+from fast_moe.kernels.triton.triton_moe import IndexSelectJaggedBmmOption
 from fast_moe.kernels.utils import (
     gpu_unavailable,
     KernelType,
@@ -26,7 +27,7 @@ class MOETest(unittest.TestCase):
         E=st.sampled_from([4, 8, 16]),
         K=st.sampled_from([2, 4]),
         D_in=st.sampled_from([32, 64]),
-        D_out=st.sampled_from([16, 32]),
+        D_out=st.sampled_from([64, 128]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
@@ -43,35 +44,65 @@ class MOETest(unittest.TestCase):
     )
     # pyre-ignore[2]
     def test_index_select_jagged_bmm_triton(self, *args, **kwargs) -> None:
-        self._test_index_select_jagged_bmm(
-            *args,
-            **kwargs,
-            test_backward=True,
-            atol=None,
-            rtol=None,
-            ref_kernel=KernelType.PYTORCH,
-            real_kernel=KernelType.TRITON,
-        )
+        for gemm_out_type in [torch.float32, torch.bfloat16]:
+            if (
+                torch.cuda.get_device_capability(torch.device("cuda"))[0] < 8
+                and gemm_out_type == torch.bfloat16
+            ):
+                continue
+            # when input type is fp32, it's unreasonable to set gemm_out_type to bf16
+            if kwargs["dtype"] == torch.float32 and gemm_out_type == torch.bfloat16:
+                continue
+            # set gemm_out_type to bf16 will decrease precision, so we set atol and rtol to be larger
+            atol = 2e-3 if gemm_out_type == torch.bfloat16 else None
+            rtol = 1e-2 if gemm_out_type == torch.bfloat16 else None
+            for grouped_gemm in [True, False]:
+                triton_option = IndexSelectJaggedBmmOption(
+                    d_jagged_use_grouped_gemm=grouped_gemm,
+                    d_jagged_gemm_out_type=gemm_out_type,
+                )
+                self._test_index_select_jagged_bmm(
+                    *args,
+                    **kwargs,
+                    test_backward=True,
+                    atol=atol,
+                    rtol=rtol,
+                    ref_kernel=KernelType.PYTORCH,
+                    real_kernel=KernelType.TRITON,
+                    test_triton_option=triton_option,
+                )
 
     # pyre-ignore[2]
     def test_index_select_jagged_bmm_big_shape_triton(self, *args, **kwargs) -> None:
-        self._test_index_select_jagged_bmm(
-            # output: 4550700 * 256 * 2 = 2,329,958,400
-            L=4550700,
-            E=4,
-            K=2,
-            D_in=256,
-            D_out=256,
-            dtype=torch.bfloat16,
-            test_backward=True,
-            contiguous=False,
-            has_bias=True,
-            allow_tf32=False,
-            atol=1e-1,
-            rtol=1e-2,
-            ref_kernel=KernelType.PYTORCH,
-            real_kernel=KernelType.TRITON,
-        )
+        for gemm_out_type in [torch.float32, torch.bfloat16]:
+            if (
+                torch.cuda.get_device_capability(torch.device("cuda"))[0] < 8
+                and gemm_out_type == torch.bfloat16
+            ):
+                continue
+            for grouped_gemm in [True, False]:
+                triton_option = IndexSelectJaggedBmmOption(
+                    d_jagged_use_grouped_gemm=grouped_gemm,
+                    d_jagged_gemm_out_type=gemm_out_type,
+                )
+                self._test_index_select_jagged_bmm(
+                    # output: 4550700 * 256 * 2 = 2,329,958,400
+                    L=4550700,
+                    E=4,
+                    K=2,
+                    D_in=256,
+                    D_out=256,
+                    dtype=torch.bfloat16,
+                    test_backward=True,
+                    contiguous=False,
+                    has_bias=True,
+                    allow_tf32=False,
+                    atol=1e-1,
+                    rtol=1e-2,
+                    ref_kernel=KernelType.PYTORCH,
+                    real_kernel=KernelType.TRITON,
+                    test_triton_option=triton_option,
+                )
 
     def _test_index_select_jagged_bmm(
         self,
@@ -89,6 +120,7 @@ class MOETest(unittest.TestCase):
         allow_tf32: bool,
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
+        test_triton_option: Optional[IndexSelectJaggedBmmOption] = None,
     ) -> None:
         set_dev_mode(True)
         from fast_moe.kernels.moe import index_select_jagged_bmm
@@ -175,6 +207,7 @@ class MOETest(unittest.TestCase):
             weight=weight_test,
             bias=bias_test,
             kernel=real_kernel,
+            triton_option=test_triton_option,
         )
 
         torch.testing.assert_close(

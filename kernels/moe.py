@@ -12,6 +12,7 @@ from fast_moe.kernels.pytorch.moe import (
 )
 
 from fast_moe.kernels.triton.triton_moe import (
+    IndexSelectJaggedBmmOption,
     triton_index_select_jagged_bmm_3D_wrapper,
     triton_index_select_jagged_bmm_wrapper,
     triton_mul_merge_k_add_wrapper,
@@ -32,6 +33,7 @@ def index_select_jagged_bmm(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     kernel: KernelType = KernelType.PYTORCH,
+    triton_option: Optional[IndexSelectJaggedBmmOption] = None,
 ) -> torch.Tensor:
     if not is_fx_tracing():
         assert index.ndim == 2 and index.shape[0] == jagged.shape[0]
@@ -43,6 +45,7 @@ def index_select_jagged_bmm(
             jagged=jagged,
             weight=weight,
             bias=bias,
+            option=triton_option,
         )
     else:
         return pytorch_index_select_jagged_bmm(
