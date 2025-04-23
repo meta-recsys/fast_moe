@@ -8,12 +8,14 @@ import torch
 from fast_moe.kernels.pytorch.moe import (
     pytorch_index_select_jagged_bmm,
     pytorch_index_select_jagged_bmm_3D,
+    pytorch_index_select_jagged_bmm_swiglu,
     pytorch_mul_merge_k_add,
 )
 
 from fast_moe.kernels.triton.triton_moe import (
     IndexSelectJaggedBmmOption,
     triton_index_select_jagged_bmm_3D_wrapper,
+    triton_index_select_jagged_bmm_swiglu_wrapper,
     triton_index_select_jagged_bmm_wrapper,
     triton_mul_merge_k_add_wrapper,
 )
@@ -140,3 +142,39 @@ def index_select_jagged_bmm_3D(
         )
     else:
         raise NotImplementedError(f"Unsupported kernel {kernel}")
+
+
+def index_select_jagged_bmm_swiglu(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_p: torch.Tensor,
+    bias_p: Optional[torch.Tensor],
+    kernel: KernelType = KernelType.PYTORCH,
+) -> torch.Tensor:
+    if not is_fx_tracing():
+        assert index.ndim == 2 and index.shape[0] == jagged.shape[0]
+    if kernel == KernelType.TRITON:
+        return triton_index_select_jagged_bmm_swiglu_wrapper(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            index=index,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+            weight_p=weight_p,
+            bias_p=bias_p,
+        )
+    else:
+        return pytorch_index_select_jagged_bmm_swiglu(
+            offsets=offsets,
+            index=index,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+            weight_p=weight_p,
+            bias_p=bias_p,
+        )

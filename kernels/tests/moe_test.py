@@ -544,3 +544,186 @@ class MOETest(unittest.TestCase):
                     atol=atol,
                     rtol=rtol,
                 )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        L=st.sampled_from([16, 32, 100, 500]),
+        E=st.sampled_from([4, 8, 16]),
+        K=st.sampled_from([2, 4]),
+        D_in=st.sampled_from([32, 64]),
+        D_out=st.sampled_from([16, 32]),
+        dtype=st.sampled_from(
+            [torch.float32, torch.bfloat16]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+        contiguous=st.booleans(),
+        has_bias=st.booleans(),
+        allow_tf32=st.sampled_from([False]),
+    )
+    # pyre-ignore[2]
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_index_select_jagged_bmm_swiglu_triton(self, *args, **kwargs) -> None:
+        self._test_index_select_jagged_bmm_swiglu(
+            *args,
+            **kwargs,
+            test_backward=True,
+            atol=None,
+            rtol=None,
+            ref_kernel=KernelType.PYTORCH,
+            real_kernel=KernelType.TRITON,
+        )
+
+    def _test_index_select_jagged_bmm_swiglu(
+        self,
+        L: int,
+        E: int,
+        K: int,
+        D_in: int,
+        D_out: int,
+        dtype: torch.dtype,
+        ref_kernel: KernelType,
+        real_kernel: KernelType,
+        test_backward: bool,
+        contiguous: bool,
+        allow_tf32: bool,
+        has_bias: bool,
+        atol: Optional[float] = None,
+        rtol: Optional[float] = None,
+        triton_cc_version: str = "",
+    ) -> None:
+        set_dev_mode(True)
+
+        from fast_moe.kernels.moe import index_select_jagged_bmm_swiglu
+
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+        torch.cuda.manual_seed(0)
+
+        gate = torch.randn(L, E, device=device).topk(K, dim=1).indices
+
+        expert, index = gate.contiguous().view(-1).sort(stable=True)
+        index = index.view(-1, K)
+
+        zeros = torch.zeros(E, dtype=expert.dtype, device=device)
+        lengths = zeros.scatter_add(0, expert, torch.ones_like(expert))
+
+        jagged_base = (
+            torch.empty((L, D_in), dtype=dtype, device=device)
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+
+        weight_base = (
+            torch.empty((E, D_in, D_out), dtype=dtype, device=device)
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+        weight_p_base = (
+            torch.empty((E, D_in, D_out), dtype=dtype, device=device)
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+
+        if has_bias:
+            bias_base = (
+                torch.empty((E, D_out), dtype=dtype, device=device)
+                .uniform_(-1.0, 1.0)
+                .requires_grad_()
+            )
+            bias_p_base = (
+                torch.empty((E, D_out), dtype=dtype, device=device)
+                .uniform_(-1.0, 1.0)
+                .requires_grad_()
+            )
+            bias_test = bias_base.detach().clone().requires_grad_()
+            bias_p_test = bias_p_base.detach().clone().requires_grad_()
+        else:
+            bias_base, bias_p_base, bias_test, bias_p_test = None, None, None, None
+
+        jagged_test = jagged_base.detach().clone().requires_grad_()
+        weight_test = weight_base.detach().clone().requires_grad_()
+        weight_p_test = weight_p_base.detach().clone().requires_grad_()
+
+        if not contiguous:
+            weight_base = (
+                weight_base.transpose(1, 2)
+                .contiguous()
+                .transpose(1, 2)
+                .detach()
+                .clone()
+                .requires_grad_()
+            )
+            weight_test = (
+                weight_test.transpose(1, 2)
+                .contiguous()
+                .transpose(1, 2)
+                .detach()
+                .clone()
+                .requires_grad_()
+            )
+            weight_p_base = (
+                weight_base.transpose(1, 2)
+                .contiguous()
+                .transpose(1, 2)
+                .detach()
+                .clone()
+                .requires_grad_()
+            )
+            weight_p_test = (
+                weight_test.transpose(1, 2)
+                .contiguous()
+                .transpose(1, 2)
+                .detach()
+                .clone()
+                .requires_grad_()
+            )
+
+        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        max_seq_len = int(lengths.max().item())
+
+        out_base = index_select_jagged_bmm_swiglu(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            index=index,
+            jagged=to_fp32_if_pytorch_kernel(jagged_base, ref_kernel),
+            weight=to_fp32_if_pytorch_kernel(weight_base, ref_kernel),
+            bias=to_fp32_if_pytorch_kernel(bias_base, ref_kernel)
+            if bias_base is not None
+            else None,
+            weight_p=to_fp32_if_pytorch_kernel(weight_p_base, ref_kernel),
+            bias_p=to_fp32_if_pytorch_kernel(bias_p_base, ref_kernel)
+            if bias_p_base is not None
+            else None,
+            kernel=ref_kernel,
+        ).to(jagged_test.dtype)
+
+        torch.cuda.manual_seed(0)
+
+        out_test = index_select_jagged_bmm_swiglu(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            index=index,
+            jagged=jagged_test,
+            weight=weight_test,
+            bias=bias_test,
+            weight_p=weight_p_test,
+            bias_p=bias_p_test,
+            kernel=real_kernel,
+        )
+
+        torch.testing.assert_close(
+            out_base,
+            out_test,
+            atol=atol,
+            rtol=rtol,
+        )

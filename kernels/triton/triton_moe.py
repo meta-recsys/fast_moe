@@ -18,6 +18,7 @@ from fast_moe.kernels.triton.triton_general_ops import (
     triton_sum_dim1,
 )
 from fast_moe.kernels.triton.utils import (
+    fast_sigmoid,
     get_bmm_configs,
     switch_to_contiguous_if_needed,
     triton_autotune,
@@ -1652,3 +1653,269 @@ def triton_jagged_bmm_reduce_sum(
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
     return d_weight, d_bias
+
+
+@torch.fx.wrap
+def triton_index_select_jagged_bmm_swiglu(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_p: torch.Tensor,
+    bias_p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return IndexSelectJaggedBmmSwiglu.apply(
+        max_seq_len,
+        offsets,
+        index,
+        jagged,
+        weight,
+        bias,
+        weight_p,
+        bias_p,
+    )
+
+
+def triton_index_select_jagged_bmm_swiglu_wrapper(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_p: torch.Tensor,
+    bias_p: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return triton_index_select_jagged_bmm_swiglu(
+        max_seq_len=max_seq_len,
+        offsets=offsets,
+        index=index,
+        jagged=jagged,
+        weight=weight,
+        bias=bias,
+        weight_p=weight_p,
+        bias_p=bias_p,
+    )
+
+
+class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        max_seq_len: int,
+        offsets: torch.Tensor,
+        index: torch.Tensor,
+        jagged: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        weight_p: torch.Tensor,
+        bias_p: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            max_seq_len (int): Maximum number of input tokens for any expert.
+            offsets (torch.Tensor): A tensor of shape [E + 1] representing the cumulative number of tokens dispatched to each expert.
+            index (torch.Tensor): A tensor of shape [L, A] that is flattened and sorted by expert.
+            jagged (torch.Tensor): A tensor of shape [L, K] representing the input tokens.
+            weight (torch.Tensor): A tensor of shape [E, K, N] containing the weights for each expert.
+            bias (torch.Tensor): A tensor of shape [E, N] containing the biases for each expert.
+            weight_p (torch.Tensor): A tensor of shape [E, K, N] containing the weights for each expert.
+            bias_p (torch.Tensor): A tensor of shape [E, N] containing the biases for each expert.
+        Returns:
+            torch.Tensor: A tensor of shape [L * A, N] containing the output after applying the linear transformation.
+        """
+        index = switch_to_contiguous_if_needed(index)
+        jagged = switch_to_contiguous_if_needed(jagged)
+        if bias is not None:
+            bias = switch_to_contiguous_if_needed(bias)
+        if bias_p is not None:
+            bias_p = switch_to_contiguous_if_needed(bias_p)
+
+        # L: number of input tokens
+        # A: number of activated experts
+        # E: number of total experts
+        # K: input dimension
+        # N: output dimension
+        L, A = index.shape
+        _, K = jagged.shape
+        E, _, N = weight.shape
+        output = torch.empty(
+            (L * A, N), dtype=jagged.dtype, device=jagged.device
+        )  # [L * A, N]
+
+        grid = lambda meta: (  # noqa E731
+            E,
+            triton.cdiv(max_seq_len, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+        _index_select_jagged_bmm_swiglu[grid](
+            seq_offsets=offsets,
+            Index=index,
+            Jagged=jagged,
+            Dense=weight,
+            Bias=bias,
+            Dense_P=weight_p,
+            Bias_P=bias_p,
+            Out=output,
+            # M is only used for trigger autotune
+            M=triton.next_power_of_2(max_seq_len),
+            N=N,
+            K=K,
+            A=A,
+            stride_jm=jagged.stride(0),
+            stride_db=weight.stride(0),
+            stride_dk=weight.stride(1),
+            stride_dn=weight.stride(2),
+            stride_bias_b=bias.stride(0) if bias is not None else 0,
+            stride_om=output.stride(0),
+            HAS_BIAS=bias is not None,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+
+        ctx.save_for_backward(offsets, index, jagged, weight, bias)
+        ctx.E = E
+        ctx.max_seq_len = max_seq_len
+        ctx.K = K
+        ctx.N = N
+
+        return output
+
+
+@triton_autotune(
+    configs=get_bmm_configs(),
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _index_select_jagged_bmm_swiglu(
+    seq_offsets,  # [B+1]
+    Index,  # [Sum_B(M)], jagged indices in range [0, L * A)
+    Jagged,  # [L, K]
+    Dense,  # [B, K, N]
+    Bias,  # [B, N]
+    Dense_P,  # [B, K, N]
+    Bias_P,  # [B, N]
+    Out,  # [Sum_B(M), N]
+    M,
+    N,
+    K,
+    A,
+    stride_jm,
+    stride_db,
+    stride_dk,
+    stride_dn,
+    stride_bias_b,
+    stride_om,
+    HAS_BIAS: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    SWiGlu(Swish-Gated Linear Unit) baseded on index_select_jagged_bmm
+
+    Out = Silu(Jagged @ Dense + Bias) * (Jagged @ Dense_P + Bias_P)
+
+    Split the kernel into (b, m, n) grid, each program processes [BLOCK_M, BLOCK_N] output elements for specific b.
+    """
+    off_b = tl.program_id(0)
+    off_m = tl.program_id(1)
+    off_n = tl.program_id(2)
+
+    seq_start = tl.load(seq_offsets + off_b, eviction_policy="evict_last")
+    seq_end = tl.load(seq_offsets + off_b + 1, eviction_policy="evict_last")
+    seq_len = seq_end - seq_start  # Matrix size in M dimension for b-th matmul
+    start_m = off_m * BLOCK_M
+    start_n = off_n * BLOCK_N
+    if start_m >= seq_len:
+        return
+
+    Index += seq_start
+    Dense += off_b * stride_db
+    Dense_P += off_b * stride_db
+    Out += seq_start.to(tl.int64) * stride_om
+
+    offs_m = start_m + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = start_n + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
+
+    # load index for all rows to be processed by this block
+    idx_ptrs = Index + offs_m
+    idx = tl.load(idx_ptrs, mask=offs_m < seq_len, other=0)  # [BLOCK_M]
+    idx = idx // A
+
+    # [BLOCK_M, BLOCK_K]
+    jg_ptrs = Jagged + idx[:, None] * stride_jm + offs_k[None, :]
+    # [BLOCK_K, BLOCK_N]
+    dn_ptrs = Dense + offs_k[:, None] * stride_dk + offs_n[None, :] * stride_dn
+    # [BLOCK_K, BLOCK_N]
+    dnp_ptrs = Dense_P + offs_k[:, None] * stride_dk + offs_n[None, :] * stride_dn
+
+    accumulator1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  # [BLOCK_M, BLOCK_N]
+    accumulator2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  # [BLOCK_M, BLOCK_N]
+    for k in range(0, K, BLOCK_K):
+        jg = tl.load(
+            jg_ptrs,
+            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
+            mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
+            other=0.0,
+        )  # [BLOCK_M, BLOCK_K]
+        dn = tl.load(
+            dn_ptrs,
+            mask=((k + offs_k)[:, None] < K) and (offs_n[None, :] < N),
+            other=0.0,
+            eviction_policy="evict_last",
+        )  # [BLOCK_K, BLOCK_N]
+        dnp = tl.load(
+            dnp_ptrs,
+            mask=((k + offs_k)[:, None] < K) and (offs_n[None, :] < N),
+            other=0.0,
+            eviction_policy="evict_last",
+        )  # [BLOCK_K, BLOCK_N]
+
+        acc1 = tl.dot(jg, dn, allow_tf32=ALLOW_TF32)  # [BLOCK_M, BLOCK_N]
+        acc2 = tl.dot(jg, dnp, allow_tf32=ALLOW_TF32)  # [BLOCK_M, BLOCK_N]
+        accumulator1 += acc1
+        accumulator2 += acc2
+        jg_ptrs += BLOCK_K
+        dn_ptrs += BLOCK_K * stride_dk
+        dnp_ptrs += BLOCK_K * stride_dk
+
+    if HAS_BIAS:
+        # load bias
+        bias_ptrs = Bias + off_b * stride_bias_b + offs_n  # [BLOCK_N]
+        biasp_ptrs = Bias_P + off_b * stride_bias_b + offs_n  # [BLOCK_N]
+
+        bias = tl.load(
+            bias_ptrs, mask=offs_n < N, eviction_policy="evict_last"
+        )  # [BLOCK_N]
+        biasp = tl.load(
+            biasp_ptrs, mask=offs_n < N, eviction_policy="evict_last"
+        )  # [BLOCK_N]
+
+        # add bias to accumulator [BLOCK_M, BLOCK_N]
+        A = accumulator1 + bias[None, :].to(tl.float32)
+        B = accumulator2 + biasp[None, :].to(tl.float32)
+    else:
+        A = accumulator1
+        B = accumulator2
+
+    # Apply Silu to A
+    a_fp32 = A.to(tl.float32)
+    a_sigmoid = fast_sigmoid(a_fp32)
+    A = (A * a_sigmoid).to(A.dtype)
+
+    out = (A * B).to(Out.dtype.element_ty)
+
+    # write back [BLOCK_M, BLOCK_N]
+    out_ptrs = Out + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    tl.store(
+        out_ptrs,
+        out,
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
