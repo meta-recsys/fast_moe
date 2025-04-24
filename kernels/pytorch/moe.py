@@ -174,3 +174,54 @@ def pytorch_index_select_jagged_bmm_3D(
     ]
 
     return torch.cat(output_list, dim=0)
+
+
+def pytorch_silu_jagged_bmm(
+    offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    has_silu: bool = True,
+) -> torch.Tensor:
+    partition_sizes: List[int] = (offsets[1:] - offsets[:-1]).tolist()
+    if has_silu:
+        jagged = F.silu(jagged)
+    jagged_list: List[torch.Tensor] = list(jagged.split(partition_sizes))
+    hidden_list: List[torch.Tensor] = [
+        F.linear(
+            jagged_list[i],
+            weight[i],
+            bias[i] if bias is not None else None,
+        )
+        for i in range(len(jagged_list))
+    ]
+
+    return torch.cat(hidden_list, dim=0)
+
+
+def pytorch_silu_jagged_bmm_combine(
+    offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    index: torch.Tensor,
+    k: int,
+    gates: Optional[torch.Tensor] = None,
+    gates_index: Optional[torch.Tensor] = None,
+    has_silu: bool = True,
+) -> torch.Tensor:
+    bmm_out = pytorch_silu_jagged_bmm(
+        offsets=offsets,
+        jagged=jagged,
+        weight=weight.permute(0, 2, 1),
+        bias=bias,
+        has_silu=has_silu,
+    )
+
+    return pytorch_mul_merge_k_add(
+        index=index,
+        value=bmm_out,
+        k=k,
+        weight=gates,
+        weight_index=gates_index,
+    )

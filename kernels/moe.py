@@ -10,6 +10,7 @@ from fast_moe.kernels.pytorch.moe import (
     pytorch_index_select_jagged_bmm_3D,
     pytorch_index_select_jagged_bmm_swiglu,
     pytorch_mul_merge_k_add,
+    pytorch_silu_jagged_bmm_combine,
 )
 
 from fast_moe.kernels.triton.triton_moe import (
@@ -18,6 +19,7 @@ from fast_moe.kernels.triton.triton_moe import (
     triton_index_select_jagged_bmm_swiglu_wrapper,
     triton_index_select_jagged_bmm_wrapper,
     triton_mul_merge_k_add_wrapper,
+    triton_silu_jagged_bmm_combine_wrapper,
 )
 from fast_moe.kernels.utils import KernelType
 from torch.fx._symbolic_trace import is_fx_tracing
@@ -177,4 +179,58 @@ def index_select_jagged_bmm_swiglu(
             bias=bias,
             weight_p=weight_p,
             bias_p=bias_p,
+        )
+
+
+def silu_jagged_bmm_combine(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    index: torch.Tensor,
+    reverse_index: torch.Tensor,
+    gates: Optional[torch.Tensor] = None,
+    gates_index: Optional[torch.Tensor] = None,
+    activation_checkpointing: bool = False,
+    has_silu: bool = True,
+    kernel: KernelType = KernelType.PYTORCH,
+) -> torch.Tensor:
+    N = index.shape[0]
+    L, K = reverse_index.shape
+    _, D_in = jagged.shape
+    E, _, D_out = weight.shape
+    if not is_fx_tracing():
+        assert index.ndim == 1 and reverse_index.ndim == 2
+        assert N == L * K and N == jagged.shape[0], f"{N=}, {L=}, {K=}, {jagged.shape=}"
+    if kernel == KernelType.TRITON:
+        return triton_silu_jagged_bmm_combine_wrapper(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+            index=index,
+            reverse_index=reverse_index,
+            k=K,
+            gates=gates,
+            gates_index=gates_index,
+            activation_checkpointing=activation_checkpointing,
+            has_silu=has_silu,
+        )
+    elif kernel == KernelType.TRITON_CC:
+        raise NotImplementedError(
+            "TRITON_CC is not supported for silu_jagged_bmm_combine"
+        )
+    else:
+        return pytorch_silu_jagged_bmm_combine(
+            offsets=offsets,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+            index=index,
+            k=K,
+            gates=gates,
+            gates_index=gates_index,
+            has_silu=has_silu,
         )

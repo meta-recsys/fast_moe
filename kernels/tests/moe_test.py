@@ -727,3 +727,184 @@ class MOETest(unittest.TestCase):
             atol=atol,
             rtol=rtol,
         )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        max_seq_len=st.sampled_from([32, 64, 200]),
+        min_seq_len=st.just(32),
+        E=st.sampled_from([4, 8]),
+        K=st.sampled_from([1, 2]),
+        D_in=st.sampled_from([128, 256]),
+        D_out=st.sampled_from([128, 256]),
+        dtype=st.sampled_from([torch.bfloat16]),
+        contiguous=st.just(True),
+        allow_tf32=st.just(False),
+        has_silu=st.booleans(),
+        has_bias=st.booleans(),
+        activation_checkpointing=st.booleans(),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=30,
+        deadline=None,
+    )
+    def test_jagged_bmm_combine(
+        self,
+        *args,  # pyre-ignore[2]
+        **kwargs,  # pyre-ignore[2]
+    ) -> None:
+        self._test_jagged_bmm_combine(
+            *args,
+            **kwargs,
+            atol=5e-1,
+            rtol=1.5e-1,
+            ref_kernel=KernelType.PYTORCH,
+            real_kernel=KernelType.TRITON,
+            test_backward=True,
+        )
+
+    def _test_jagged_bmm_combine(
+        self,
+        min_seq_len: int,
+        max_seq_len: int,
+        E: int,
+        K: int,
+        D_in: int,
+        D_out: int,
+        dtype: torch.dtype,
+        ref_kernel: KernelType,
+        real_kernel: KernelType,
+        test_backward: bool,
+        contiguous: bool,
+        allow_tf32: bool,
+        has_silu: bool,
+        has_bias: bool,
+        activation_checkpointing: bool = False,
+        atol: Optional[float] = None,
+        rtol: Optional[float] = None,
+    ) -> None:
+        from fast_moe.kernels.moe import silu_jagged_bmm_combine
+
+        torch.cuda.manual_seed(0)
+
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+
+        seq_len = torch.randint(
+            low=min_seq_len, high=max_seq_len + 1, size=(E,), device=device
+        )
+        N = int(seq_len.sum().item())
+
+        logits = torch.rand((N, E), device=device, dtype=dtype) + 1e-2
+        topk_gates, topk_indices = logits.topk(k=K, dim=1)
+
+        _, gates_index = topk_indices.view(-1).sort(stable=True)
+        zeros = torch.zeros_like(logits, dtype=dtype)
+        gates = zeros.scatter(1, topk_indices, topk_gates)
+        index: torch.Tensor = gates_index // topk_indices.size(1)
+        reverse_index: torch.Tensor = index.sort(stable=True)[1].view_as(topk_indices)
+        lengths = (gates > 0).sum(0)
+        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        max_seq_len = int(lengths.max().item())
+
+        jagged_base = (
+            torch.empty((N * K, D_in), dtype=dtype, device=device)
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+        weight_base = (
+            torch.empty((E, D_in, D_out), dtype=dtype, device=device)
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+        bias_base = (
+            (
+                torch.empty((E, D_out), dtype=dtype, device=device)
+                .uniform_(-1.0, 1.0)
+                .requires_grad_()
+            )
+            if has_bias
+            else None
+        )
+
+        gates_base = topk_gates.clone().requires_grad_()
+
+        if not contiguous:
+            weight_base = (
+                weight_base.transpose(1, 2)
+                .contiguous()
+                .transpose(1, 2)
+                .detach()
+                .clone()
+                .requires_grad_()
+            )
+
+        jagged_test = jagged_base.detach().clone().requires_grad_()
+        weight_test = weight_base.detach().clone().requires_grad_()
+        # pyre-ignore
+        bias_test = bias_base.detach().clone().requires_grad_() if has_bias else None
+        gates_test = gates_base.detach().clone().requires_grad_()
+
+        out_base = silu_jagged_bmm_combine(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            jagged=jagged_base,
+            weight=weight_base,
+            bias=bias_base,
+            index=index,
+            reverse_index=reverse_index,
+            gates=gates_base,
+            gates_index=gates_index,
+            activation_checkpointing=activation_checkpointing,
+            has_silu=has_silu,
+            kernel=ref_kernel,
+        )
+
+        out_test = silu_jagged_bmm_combine(
+            max_seq_len=max_seq_len,
+            offsets=offsets.to(device),
+            jagged=jagged_test.to(device),
+            weight=weight_test.to(device),
+            bias=None if bias_test is None else bias_test.to(device),
+            index=index.to(device),
+            reverse_index=reverse_index.to(device),
+            gates=gates_test.to(device),
+            gates_index=gates_index.to(device),
+            activation_checkpointing=activation_checkpointing,
+            has_silu=has_silu,
+            kernel=real_kernel,
+        )
+
+        torch.testing.assert_close(
+            out_base,
+            out_test,
+            atol=atol,
+            rtol=rtol,
+        )
+
+        if test_backward:
+            dout = torch.randn_like(out_base) * 0.01
+            out_base.backward(dout)
+            out_test.backward(dout.to(device))
+
+            for p_base, p_test in zip(
+                [jagged_base, weight_base, gates_base],
+                [jagged_test, weight_test, gates_test],
+            ):
+                torch.testing.assert_close(
+                    p_base.grad,
+                    p_test.grad,
+                    atol=atol,
+                    rtol=rtol,
+                )
+            if has_bias and bias_base is not None and bias_test is not None:
+                torch.testing.assert_close(
+                    bias_base.grad,
+                    bias_test.grad,
+                    atol=atol,
+                    rtol=rtol,
+                )
