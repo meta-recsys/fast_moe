@@ -1481,9 +1481,9 @@ def _jagged_jagged_bmm(
     JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), and Out has shape (B, M, N)
     """
 
-    off_b = tl.program_id(0)
-    off_m = tl.program_id(1)
-    off_n = tl.program_id(2)
+    off_m = tl.program_id(0)
+    off_n = tl.program_id(1)
+    off_b = tl.program_id(2)
 
     seq_start = tl.load(seq_offsets + off_b).to(tl.int64)
     seq_end = tl.load(seq_offsets + off_b + 1)
@@ -1615,9 +1615,9 @@ def triton_jagged_bmm_reduce_sum(
     N = JaggedB.shape[1]
     d_weight = torch.empty((B, M, N), dtype=dtype, device=device)
     grid = lambda meta: (  # noqa E731
-        B,
         triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(N, meta["BLOCK_N"]),
+        B,
     )
     _jagged_jagged_bmm[grid](
         seq_offsets=offsets,
