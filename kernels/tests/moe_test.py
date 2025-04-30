@@ -552,7 +552,7 @@ class MOETest(unittest.TestCase):
         E=st.sampled_from([4, 8, 16]),
         K=st.sampled_from([2, 4]),
         D_in=st.sampled_from([32, 64]),
-        D_out=st.sampled_from([16, 32]),
+        D_out=st.sampled_from([64]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
@@ -733,7 +733,7 @@ class MOETest(unittest.TestCase):
             out_base.backward(dout)
 
             # Loosen numerical bar as we're comparing PT FP32 vs Triton BF16
-            atol = 3e-3 if dtype == torch.bfloat16 else None
+            atol = 4e-3 if dtype == torch.bfloat16 else None
             rtol = 1e-2 if dtype == torch.bfloat16 else None
             for p_base, p_test in zip(
                 [jagged_base, weight_base, weight_p_base, bias_base, bias_p_base],

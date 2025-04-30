@@ -1803,6 +1803,8 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         )
         ctx.E = E
         ctx.max_seq_len = max_seq_len
+        ctx.L = L
+        ctx.A = A
         ctx.K = K
         ctx.N = N
 
@@ -1849,7 +1851,7 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         offsets, index, jagged, weight, bias, weight_p, bias_p, a, alpha, beta = (
             ctx.saved_tensors
         )
-        E, K, N = ctx.E, ctx.K, ctx.N
+        _, K, L, A, N = ctx.E, ctx.K, ctx.L, ctx.A, ctx.N
         has_bias = bias is not None
 
         d_alpha = d_out * beta
@@ -1874,113 +1876,54 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         if has_bias:
             d_bias = torch.zeros_like(bias)  # [E, N]
             d_bias_p = torch.zeros_like(bias_p)  # [E, N]
-            stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
         else:
             d_bias = None
             d_bias_p = None
-            stride_orb, stride_orn = 0, 0
 
-        # Compute gradients for weight and bias from d_a
-        grid = lambda meta: (  # noqa E731
-            E,
-            triton.cdiv(K, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
-        _indexed_jagged_jagged_bmm_reduce_sum[grid](
-            seq_offsets=offsets,
-            Index=index.view(-1) // index.shape[1],
-            JaggedA=jagged,
-            JaggedB=d_a,
-            Out=d_weight,
-            ReduceOut=d_bias,
-            M=K,
-            N=N,
-            # K is only used for triggering autotune
-            K=triton.next_power_of_2(ctx.max_seq_len),
-            stride_ak=jagged.stride(0),
-            stride_bk=d_a.stride(0),
-            stride_ob=d_weight.stride(0),
-            stride_om=d_weight.stride(1),
-            stride_on=d_weight.stride(2),
-            stride_orb=stride_orb,
-            stride_orn=stride_orn,
-            REDUCE_JAGGEDB=has_bias,
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
+        jagged_a = triton_index_select(
+            jagged, index.flatten() // index.shape[1]
+        )  # [L * A, K]
+        d_weight, d_bias = triton_jagged_bmm_reduce_sum(
+            JaggedA=jagged_a,  # [L * A, K]
+            JaggedB=d_a,  # [L * A, N]
+            offsets=offsets,  # [E + 1]
+            reduce_sum=bias is not None,
+        )  # [E, K, N], [E, N]
 
-        # Compute gradients for weight_p and bias_p from d_beta
-        grid = lambda meta: (  # noqa E731
-            E,
-            triton.cdiv(K, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
-        _indexed_jagged_jagged_bmm_reduce_sum[grid](
-            seq_offsets=offsets,
-            Index=index.view(-1) // index.shape[1],
-            JaggedA=jagged,
-            JaggedB=d_beta,
-            Out=d_weight_p,
-            ReduceOut=d_bias_p,
-            M=K,
-            N=N,
-            # K is only used for triggering autotune
-            K=triton.next_power_of_2(ctx.max_seq_len),
-            stride_ak=jagged.stride(0),
-            stride_bk=d_beta.stride(0),
-            stride_ob=d_weight_p.stride(0),
-            stride_om=d_weight_p.stride(1),
-            stride_on=d_weight_p.stride(2),
-            stride_orb=stride_orb,
-            stride_orn=stride_orn,
-            REDUCE_JAGGEDB=has_bias,
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
+        d_weight_p, d_bias_p = triton_jagged_bmm_reduce_sum(
+            JaggedA=jagged_a,  # [L * A, K]
+            JaggedB=d_beta,  # [L * A, N]
+            offsets=offsets,  # [E + 1]
+            reduce_sum=bias_p is not None,
+        )  # [E, K, N], [E, N]
 
-        grid = lambda meta: (  # noqa E731
-            triton.cdiv(ctx.max_seq_len, meta["BLOCK_M"]),
-            E,
-            triton.cdiv(K, meta["BLOCK_N"]),
-        )
-        _jagged_bmm_index_add[grid](
-            seq_offsets=offsets,
-            Index=index,
-            Jagged=d_a,
-            Dense=weight,
-            Out=d_jagged_expanded_1,
-            # M is only used for triggering autotune
-            M=triton.next_power_of_2(ctx.max_seq_len),
-            N=K,
-            K=N,
-            stride_jm=d_a.stride(0),
-            stride_db=weight.stride(0),
-            stride_dk=weight.stride(2),
-            stride_dn=weight.stride(1),
-            stride_om=d_jagged_expanded_1.stride(1),
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
+        assert N % 64 == 0, "N must be a multiple of 64"
+        m_sizes = (offsets[1:] - offsets[:-1]).to(torch.int32)  # [E]
+        weight_grouped = weight.reshape(-1, N)  # [E, K, N] -> [E * K, N]
+        weight_p_grouped = weight_p.reshape(-1, N)  # [E, K, N] -> [E * K, N]
+        d_jagged_expanded_1 = grouped_gemm(
+            x=d_a,  # [L * A, N]
+            w=weight_grouped,  # [E * K, N]
+            m_sizes=m_sizes,  # [E]
+            use_fast_accum=False,
+            allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+            _use_warp_specialization=True,
+            _out_type=jagged.dtype,
+            _out_index=index.flatten(),
+        )  # [L * A, K]
+        d_jagged_expanded_1 = d_jagged_expanded_1.view((L, A, K))  # [L, A, K]
 
-        grid = lambda meta: (  # noqa E731
-            triton.cdiv(ctx.max_seq_len, meta["BLOCK_M"]),
-            E,
-            triton.cdiv(K, meta["BLOCK_N"]),
-        )
-        _jagged_bmm_index_add[grid](
-            seq_offsets=offsets,
-            Index=index,
-            Jagged=d_beta,
-            Dense=weight_p,
-            Out=d_jagged_expanded_2,
-            # M is only used for triggering autotune
-            M=triton.next_power_of_2(ctx.max_seq_len),
-            N=K,
-            K=N,
-            stride_jm=d_beta.stride(0),
-            stride_db=weight_p.stride(0),
-            stride_dk=weight_p.stride(2),
-            stride_dn=weight_p.stride(1),
-            stride_om=d_jagged_expanded_2.stride(1),
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
+        d_jagged_expanded_2 = grouped_gemm(
+            x=d_beta,  # [L * A, N]
+            w=weight_p_grouped,  # [E * K, N]
+            m_sizes=m_sizes,  # [E]
+            use_fast_accum=False,
+            allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+            _use_warp_specialization=True,
+            _out_type=jagged.dtype,
+            _out_index=index.flatten(),
+        )  # [L * A, K]
+        d_jagged_expanded_2 = d_jagged_expanded_2.view((L, A, K))  # [L, A, K]
 
         d_jagged = triton_sum_dim1(d_jagged_expanded_1) + triton_sum_dim1(
             d_jagged_expanded_2
