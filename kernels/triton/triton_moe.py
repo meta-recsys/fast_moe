@@ -2646,18 +2646,6 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
         )
 
         d_jagged = torch.empty_like(jagged)
-        # tensors below needs to be initialized with zeros as there could be unused
-        # rows in the weight and bias
-        d_weight = torch.zeros_like(weight)
-
-        if has_bias:
-            d_bias = torch.zeros(
-                (ctx.E, ctx.D_out), device=d_output.device, dtype=d_output.dtype
-            )
-            stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
-        else:
-            d_bias = None
-            stride_orb, stride_orn = 0, 0
 
         grid = lambda meta: (  # noqa E731
             triton.cdiv(ctx.D_in, meta["BLOCK_K"]),
@@ -2701,30 +2689,51 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
                 ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
             )
 
-        grid = lambda meta: (  # noqa E731
-            ctx.E,
-            triton.cdiv(ctx.D_in, meta["BLOCK_M"]),
-            triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
-        )
-        _jagged_jagged_bmm_reduce_sum[grid](
-            seq_offsets=offsets,
-            JaggedA=silu_jagged,
-            JaggedB=d_bmm_out,
-            Out=d_weight,
-            ReduceOut=d_bias,
-            M=ctx.D_in,
-            N=ctx.D_out,
-            AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
-            stride_ak=silu_jagged.stride(0),
-            stride_bk=d_bmm_out.stride(0),
-            stride_ob=d_weight.stride(0),
-            stride_om=d_weight.stride(1),
-            stride_on=d_weight.stride(2),
-            stride_orb=stride_orb,
-            stride_orn=stride_orn,
-            REDUCE_JAGGEDB=has_bias,
-            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-        )
+        optimize = True
+        if optimize:
+            d_weight, d_bias = triton_jagged_bmm_reduce_sum(
+                JaggedA=silu_jagged,
+                JaggedB=d_bmm_out,
+                offsets=offsets,
+                reduce_sum=has_bias,
+            )
+        else:
+            # tensors below needs to be initialized with zeros as there could be unused
+            # rows in the weight and bias
+            d_weight = torch.zeros_like(weight)
+
+            if has_bias:
+                d_bias = torch.zeros(
+                    (ctx.E, ctx.D_out), device=d_output.device, dtype=d_output.dtype
+                )
+                stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
+            else:
+                d_bias = None
+                stride_orb, stride_orn = 0, 0
+            grid = lambda meta: (  # noqa E731
+                ctx.E,
+                triton.cdiv(ctx.D_in, meta["BLOCK_M"]),
+                triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
+            )
+            _jagged_jagged_bmm_reduce_sum[grid](
+                seq_offsets=offsets,
+                JaggedA=silu_jagged,
+                JaggedB=d_bmm_out,
+                Out=d_weight,
+                ReduceOut=d_bias,
+                M=ctx.D_in,
+                N=ctx.D_out,
+                AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+                stride_ak=silu_jagged.stride(0),
+                stride_bk=d_bmm_out.stride(0),
+                stride_ob=d_weight.stride(0),
+                stride_om=d_weight.stride(1),
+                stride_on=d_weight.stride(2),
+                stride_orb=stride_orb,
+                stride_orn=stride_orn,
+                REDUCE_JAGGEDB=has_bias,
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            )
 
         return (
             None,  # max_seq_len
