@@ -672,7 +672,7 @@ class MOETest(unittest.TestCase):
                 .requires_grad_()
             )
             weight_p_base = (
-                weight_base.transpose(1, 2)
+                weight_p_base.transpose(1, 2)
                 .contiguous()
                 .transpose(1, 2)
                 .detach()
@@ -680,7 +680,7 @@ class MOETest(unittest.TestCase):
                 .requires_grad_()
             )
             weight_p_test = (
-                weight_test.transpose(1, 2)
+                weight_p_test.transpose(1, 2)
                 .contiguous()
                 .transpose(1, 2)
                 .detach()
@@ -727,6 +727,25 @@ class MOETest(unittest.TestCase):
             atol=atol,
             rtol=rtol,
         )
+        if test_backward:
+            dout = torch.randn_like(out_test) * 0.01
+            out_test.backward(dout)
+            out_base.backward(dout)
+
+            # Loosen numerical bar as we're comparing PT FP32 vs Triton BF16
+            atol = 3e-3 if dtype == torch.bfloat16 else None
+            rtol = 1e-2 if dtype == torch.bfloat16 else None
+            for p_base, p_test in zip(
+                [jagged_base, weight_base, weight_p_base, bias_base, bias_p_base],
+                [jagged_test, weight_test, weight_p_test, bias_test, bias_p_test],
+            ):
+                if p_base is not None and p_test is not None:
+                    torch.testing.assert_close(
+                        p_base.grad,
+                        p_test.grad,
+                        atol=atol,
+                        rtol=rtol,
+                    )
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore

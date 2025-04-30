@@ -15,6 +15,7 @@ import triton.language as tl
 from fast_moe.kernels.triton.grouped_gemm import grouped_gemm
 from fast_moe.kernels.triton.triton_general_ops import (
     triton_index_select,
+    triton_silu_backward,
     triton_sum_dim1,
 )
 from fast_moe.kernels.triton.utils import (
@@ -1745,6 +1746,15 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         output = torch.empty(
             (L * A, N), dtype=jagged.dtype, device=jagged.device
         )  # [L * A, N]
+        alpha = torch.empty(
+            (L * A, N), dtype=jagged.dtype, device=jagged.device
+        )  # [L * A, N]
+        alpha_silu = torch.empty(
+            (L * A, N), dtype=jagged.dtype, device=jagged.device
+        )  # [L * A, N]
+        beta = torch.empty(
+            (L * A, N), dtype=jagged.dtype, device=jagged.device
+        )  # [L * A, N]
 
         grid = lambda meta: (  # noqa E731
             E,
@@ -1761,6 +1771,9 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
             Dense_P=weight_p,
             Bias_P=bias_p,
             Out=output,
+            ALPHA=alpha,
+            ALPHA_SILU=alpha_silu,
+            BETA=beta,
             # M is only used for trigger autotune
             M=triton.next_power_of_2(max_seq_len),
             N=N,
@@ -1776,13 +1789,213 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
 
-        ctx.save_for_backward(offsets, index, jagged, weight, bias)
+        ctx.save_for_backward(
+            offsets,
+            index,
+            jagged,
+            weight,
+            bias,
+            weight_p,
+            bias_p,
+            alpha,
+            alpha_silu,
+            beta,
+        )
         ctx.E = E
         ctx.max_seq_len = max_seq_len
         ctx.K = K
         ctx.N = N
 
         return output
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx,
+        d_out: torch.Tensor,
+    ) -> Tuple[
+        None,
+        None,
+        None,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
+        """
+        Args:
+            d_out (torch.Tensor): A tensor of shape [L * A, N] representing the gradient of the output.
+        Returns:
+            Tuple[None, None, None, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - None: No gradient is computed for `max_seq_len`.
+                - None: No gradient is computed for `offsets`.
+                - None: No gradient is computed for `index`.
+                - torch.Tensor: Gradient with respect to `jagged`, of shape [L, K].
+                - torch.Tensor: Gradient with respect to `weight`, of shape [E, K, N].
+                - torch.Tensor: Gradient with respect to `bias`, of shape [E, N].
+                - torch.Tensor: Gradient with respect to `weight_p`, of shape [E, K, N].
+                - torch.Tensor: Gradient with respect to `bias_p`, of shape [E, N].
+        """
+        # offsets: [E + 1]
+        # index: [L, A]
+        # jagged: [L, K]
+        # weight: [E, K, N]
+        # bias: [E, N]
+        # weight_p: [E, K, N]
+        # bias_p: [E, N]
+        # a: [L * A, N]
+        # beta: [L * A, N]
+        offsets, index, jagged, weight, bias, weight_p, bias_p, a, alpha, beta = (
+            ctx.saved_tensors
+        )
+        E, K, N = ctx.E, ctx.K, ctx.N
+        has_bias = bias is not None
+
+        d_alpha = d_out * beta
+        d_beta = d_out * alpha
+
+        d_a = triton_silu_backward(a, d_alpha)
+
+        d_jagged_expanded_1 = torch.empty(
+            (jagged.shape[0], index.shape[1], jagged.shape[1]),
+            device=jagged.device,
+            dtype=torch.float32,
+        )  # [L, A, K]
+        d_jagged_expanded_2 = torch.empty(
+            (jagged.shape[0], index.shape[1], jagged.shape[1]),
+            device=jagged.device,
+            dtype=torch.float32,
+        )  # [L, A, K]
+        # tensors below needs to be initialized with zeros as there could be unused
+        # rows in the weight and bias
+        d_weight = torch.zeros_like(weight)  # [E, K, N]
+        d_weight_p = torch.zeros_like(weight_p)  # [E, K, N]
+        if has_bias:
+            d_bias = torch.zeros_like(bias)  # [E, N]
+            d_bias_p = torch.zeros_like(bias_p)  # [E, N]
+            stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
+        else:
+            d_bias = None
+            d_bias_p = None
+            stride_orb, stride_orn = 0, 0
+
+        # Compute gradients for weight and bias from d_a
+        grid = lambda meta: (  # noqa E731
+            E,
+            triton.cdiv(K, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _indexed_jagged_jagged_bmm_reduce_sum[grid](
+            seq_offsets=offsets,
+            Index=index.view(-1) // index.shape[1],
+            JaggedA=jagged,
+            JaggedB=d_a,
+            Out=d_weight,
+            ReduceOut=d_bias,
+            M=K,
+            N=N,
+            # K is only used for triggering autotune
+            K=triton.next_power_of_2(ctx.max_seq_len),
+            stride_ak=jagged.stride(0),
+            stride_bk=d_a.stride(0),
+            stride_ob=d_weight.stride(0),
+            stride_om=d_weight.stride(1),
+            stride_on=d_weight.stride(2),
+            stride_orb=stride_orb,
+            stride_orn=stride_orn,
+            REDUCE_JAGGEDB=has_bias,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+
+        # Compute gradients for weight_p and bias_p from d_beta
+        grid = lambda meta: (  # noqa E731
+            E,
+            triton.cdiv(K, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _indexed_jagged_jagged_bmm_reduce_sum[grid](
+            seq_offsets=offsets,
+            Index=index.view(-1) // index.shape[1],
+            JaggedA=jagged,
+            JaggedB=d_beta,
+            Out=d_weight_p,
+            ReduceOut=d_bias_p,
+            M=K,
+            N=N,
+            # K is only used for triggering autotune
+            K=triton.next_power_of_2(ctx.max_seq_len),
+            stride_ak=jagged.stride(0),
+            stride_bk=d_beta.stride(0),
+            stride_ob=d_weight_p.stride(0),
+            stride_om=d_weight_p.stride(1),
+            stride_on=d_weight_p.stride(2),
+            stride_orb=stride_orb,
+            stride_orn=stride_orn,
+            REDUCE_JAGGEDB=has_bias,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(ctx.max_seq_len, meta["BLOCK_M"]),
+            E,
+            triton.cdiv(K, meta["BLOCK_N"]),
+        )
+        _jagged_bmm_index_add[grid](
+            seq_offsets=offsets,
+            Index=index,
+            Jagged=d_a,
+            Dense=weight,
+            Out=d_jagged_expanded_1,
+            # M is only used for triggering autotune
+            M=triton.next_power_of_2(ctx.max_seq_len),
+            N=K,
+            K=N,
+            stride_jm=d_a.stride(0),
+            stride_db=weight.stride(0),
+            stride_dk=weight.stride(2),
+            stride_dn=weight.stride(1),
+            stride_om=d_jagged_expanded_1.stride(1),
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(ctx.max_seq_len, meta["BLOCK_M"]),
+            E,
+            triton.cdiv(K, meta["BLOCK_N"]),
+        )
+        _jagged_bmm_index_add[grid](
+            seq_offsets=offsets,
+            Index=index,
+            Jagged=d_beta,
+            Dense=weight_p,
+            Out=d_jagged_expanded_2,
+            # M is only used for triggering autotune
+            M=triton.next_power_of_2(ctx.max_seq_len),
+            N=K,
+            K=N,
+            stride_jm=d_beta.stride(0),
+            stride_db=weight_p.stride(0),
+            stride_dk=weight_p.stride(2),
+            stride_dn=weight_p.stride(1),
+            stride_om=d_jagged_expanded_2.stride(1),
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+
+        d_jagged = triton_sum_dim1(d_jagged_expanded_1) + triton_sum_dim1(
+            d_jagged_expanded_2
+        )
+
+        return (
+            None,
+            None,
+            None,
+            d_jagged.to(jagged.dtype),
+            d_weight,
+            d_bias,
+            d_weight_p,
+            d_bias_p,
+        )
 
 
 @triton_autotune(
@@ -1799,6 +2012,9 @@ def _index_select_jagged_bmm_swiglu(
     Dense_P,  # [B, K, N]
     Bias_P,  # [B, N]
     Out,  # [Sum_B(M), N]
+    ALPHA,  # [Sum_B(M), N]
+    ALPHA_SILU,  # [Sum_B(M), N]
+    BETA,  # [Sum_B(M), N]
     M,
     N,
     K,
@@ -1838,6 +2054,9 @@ def _index_select_jagged_bmm_swiglu(
     Dense += off_b * stride_db
     Dense_P += off_b * stride_db
     Out += seq_start.to(tl.int64) * stride_om
+    ALPHA += seq_start.to(tl.int64) * stride_om
+    ALPHA_SILU += seq_start.to(tl.int64) * stride_om
+    BETA += seq_start.to(tl.int64) * stride_om
 
     offs_m = start_m + tl.arange(0, BLOCK_M)  # [BLOCK_M]
     offs_n = start_n + tl.arange(0, BLOCK_N)  # [BLOCK_N]
@@ -1905,17 +2124,40 @@ def _index_select_jagged_bmm_swiglu(
         B = accumulator2
 
     # Apply Silu to A
-    a_fp32 = A.to(tl.float32)
-    a_sigmoid = fast_sigmoid(a_fp32)
-    A = (A * a_sigmoid).to(A.dtype)
+    a_sigmoid = fast_sigmoid(A)
+    A_SILU = A * a_sigmoid
 
-    out = (A * B).to(Out.dtype.element_ty)
+    out = (A_SILU * B).to(Out.dtype.element_ty)
 
     # write back [BLOCK_M, BLOCK_N]
     out_ptrs = Out + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    alpha_ptrs = ALPHA + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    alpha_silu_ptrs = (
+        ALPHA_SILU + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    )
+    beta_ptrs = BETA + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
     tl.store(
         out_ptrs,
         out,
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+    tl.store(
+        alpha_ptrs,
+        A.to(ALPHA.dtype.element_ty),
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+    tl.store(
+        alpha_silu_ptrs,
+        A_SILU.to(ALPHA_SILU.dtype.element_ty),
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+
+    tl.store(
+        beta_ptrs,
+        B.to(BETA.dtype.element_ty),
         mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
         eviction_policy="evict_first",
     )
