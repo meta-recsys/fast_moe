@@ -299,3 +299,54 @@ def triton_jagged_reduce_sum(
         stride_orn=out.stride(1),
     )
     return out
+
+
+@triton_autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_N": BLOCK_N,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_N in [512, 1024]
+        for num_stages in [2, 3]
+        for num_warps in [4, 8]
+    ],
+    key=["N"],
+)
+@triton.jit
+def _kernel_silu_backward(
+    x_ptr,  # float*  : forward‑input tensor
+    dy_ptr,  # float*  : upstream grad dY
+    dx_ptr,  # float*  : output grad dX
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < N
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    dy = tl.load(dy_ptr + offs, mask=mask, other=0.0)
+
+    x_fp32 = x.to(tl.float32)
+    sig = tl.sigmoid(x_fp32)  # σ(x)
+    dx = dy * sig * (1.0 + x * (1.0 - sig))  # dX formula
+
+    tl.store(dx_ptr + offs, dx.to(dx_ptr.dtype.element_ty), mask=mask)
+
+
+def triton_silu_backward(x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    """
+    Compute dX for SiLU given input x and upstream gradient dy.
+    Both tensors must have identical shape and live on the same CUDA device.
+    """
+    assert x.shape == dy.shape and x.device == dy.device
+    n = x.numel()
+    dx = torch.empty_like(x)
+
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_N"]),)  # noqa E731
+    _kernel_silu_backward[grid](x, dy, dx, n)
+    return dx
