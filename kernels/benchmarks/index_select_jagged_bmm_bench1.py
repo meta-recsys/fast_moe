@@ -12,6 +12,7 @@ from fast_moe.kernels.moe import index_select_jagged_bmm
 from fast_moe.kernels.moe_fp8 import (
     index_select_jagged_bmm as index_select_jagged_bmm_fp8,
 )
+from fast_moe.kernels.triton.triton_moe import IndexSelectJaggedBmmOption
 from fast_moe.kernels.utils import KernelType
 
 # buck2 run @mode/{opt,inplace} //fast_moe/kernels/benchmarks:index_select_jagged_bmm_bench1 -- --provider triton_fp8 --num-tokens 822171 -e 32 -k 4 -m 512 -n 256
@@ -31,7 +32,11 @@ class IndexSelectJaggedBMMModule(torch.nn.Module):
         weight: torch.Tensor,
         bias: torch.Tensor,
     ) -> torch.Tensor:
-        if provider in ["triton", "pytorch"]:
+        if provider in ["triton", "triton_split_k", "pytorch"]:
+            if provider == "triton_split_k":
+                option = IndexSelectJaggedBmmOption(d_weight_split_k_kernel=True)
+            else:
+                option = IndexSelectJaggedBmmOption()
             return index_select_jagged_bmm(  # noqa E731
                 max_seq_len=max_seq_len,
                 offsets=offsets,
@@ -40,6 +45,7 @@ class IndexSelectJaggedBMMModule(torch.nn.Module):
                 weight=weight,
                 bias=bias,
                 kernel=get_kernel(provider),
+                triton_option=option,
             )
         elif provider == "triton_fp8":
             return index_select_jagged_bmm_fp8(  # noqa E731
@@ -65,6 +71,7 @@ class IndexSelectJaggedBMMModuleFactory(ModuleFactory):
         K: int = 32,
         M: int = 512,
         N: int = 128,
+        add_randomness: bool = False,
     ) -> None:
         self.provider = provider
         self.L = L
@@ -72,6 +79,7 @@ class IndexSelectJaggedBMMModuleFactory(ModuleFactory):
         self.K = K
         self.M = M
         self.N = N
+        self.add_randomness = add_randomness
 
     def module_name(self) -> str:
         return "index_select_jagged_bmm"
@@ -92,7 +100,19 @@ class IndexSelectJaggedBMMModuleFactory(ModuleFactory):
     ) -> Dict[str, Any]:
         module_inputs: Dict[str, Any] = {}
 
-        gate = torch.randn(self.L, self.E, device=device).topk(self.K, dim=1).indices
+        torch.manual_seed(42)
+        if self.add_randomness:
+            gate_random_rate = torch.randn(self.E, device=device).view(1, -1)
+        else:
+            gate_random_rate = torch.zeros(self.E, device=device).view(1, -1)
+        gate = (
+            (torch.randn(self.L, self.E, device=device) + gate_random_rate)
+            .topk(self.K, dim=1)
+            .indices
+        )
+
+        _, counts = torch.unique(gate, return_counts=True)
+        print("Tokens Per Expert:", counts)
 
         expert, index = gate.contiguous().view(-1).sort(stable=True)
         index = index.view(-1, self.K)
@@ -168,7 +188,13 @@ class IndexSelectJaggedBMMModuleFactory(ModuleFactory):
     default=128,
     show_default=True,
 )
-def main(provider: str, num_tokens: int, e: int, k: int, m: int, n: int) -> None:
+@click.option(
+    "--add-randomness",
+    is_flag=True,
+)
+def main(
+    provider: str, num_tokens: int, e: int, k: int, m: int, n: int, add_randomness: bool
+) -> None:
     factory = IndexSelectJaggedBMMModuleFactory(
         provider=provider,
         L=num_tokens,
@@ -176,6 +202,7 @@ def main(provider: str, num_tokens: int, e: int, k: int, m: int, n: int) -> None
         K=k,
         M=m,
         N=n,
+        add_randomness=add_randomness,
     )
     bench = TrainModuleBench(factory, precision="bf16", run_backward=True)
     bench.run_benchmark()

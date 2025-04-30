@@ -21,6 +21,7 @@ from fast_moe.kernels.triton.triton_general_ops import (
 from fast_moe.kernels.triton.utils import (
     fast_sigmoid,
     get_bmm_configs,
+    get_bmm_split_k_configs,
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
@@ -32,6 +33,7 @@ class IndexSelectJaggedBmmOption:
     d_jagged_use_grouped_gemm: bool = True
     d_jagged_gemm_out_type: torch.dtype = torch.float32
     d_weight_optimization: bool = True
+    d_weight_split_k_kernel: bool = False
 
 
 @torch.fx.wrap
@@ -638,12 +640,20 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
             jagged_a = triton_index_select(
                 jagged, index.flatten() // index.shape[1]
             )  # [L * A, K]
-            d_weight, d_bias = triton_jagged_bmm_reduce_sum(
-                JaggedA=jagged_a,  # [L * A, K]
-                JaggedB=d_out,  # [L * A, N]
-                offsets=offsets,  # [E + 1]
-                reduce_sum=bias is not None,
-            )  # [E, K, N], [E, N]
+            if option.d_weight_split_k_kernel:
+                d_weight, d_bias = triton_jagged_bmm_reduce_sum_split_k(
+                    JaggedA=jagged_a,  # [L * A, K]
+                    JaggedB=d_out,  # [L * A, N]
+                    offsets=offsets,  # [E + 1]
+                    reduce_sum=bias is not None,
+                )  # [E, K, N], [E, N]
+            else:
+                d_weight, d_bias = triton_jagged_bmm_reduce_sum(
+                    JaggedA=jagged_a,  # [L * A, K]
+                    JaggedB=d_out,  # [L * A, N]
+                    offsets=offsets,  # [E + 1]
+                    reduce_sum=bias is not None,
+                )  # [E, K, N], [E, N]
         else:
             has_bias = False
             # tensors below needs to be initialized with zeros as there could be unused
@@ -1527,6 +1537,117 @@ def _jagged_jagged_bmm(
 
     out = accumulator.to(Out.dtype.element_ty)
     tl.store(out_ptrs, out.T, mask=(offs_n[:, None] < N) & (offs_m[None, :] < M))
+
+
+@triton.jit
+def cdiv_fn(x, y):
+    return (x + y - 1) // y
+
+
+@triton_autotune(
+    configs=get_bmm_split_k_configs(),
+    key=["M", "N", "AUTOTUNE_K"],
+    restore_value=["Out"],
+)
+@triton.jit
+def _jagged_jagged_bmm_split_k(
+    seq_offsets,
+    JaggedA,
+    JaggedB,
+    Out,
+    M,
+    N,
+    AUTOTUNE_K,
+    stride_ak,
+    stride_bk,
+    stride_ob,
+    stride_om,
+    stride_on,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """
+    Computing bmm Out = Jagged x Jagged
+    K is the jagged dimension
+    JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), and Out has shape (B, M, N)
+    """
+
+    off_mn = tl.program_id(1)
+    num_n_blocks = cdiv_fn(N, BLOCK_N)
+    off_m = off_mn // num_n_blocks
+    off_n = off_mn % num_n_blocks
+
+    off_k = tl.program_id(0)
+
+    off_b = tl.program_id(2)
+
+    seq_start = tl.load(seq_offsets + off_b).to(tl.int64)
+    seq_end = tl.load(seq_offsets + off_b + 1)
+    seq_len = seq_end - seq_start
+
+    start_m = off_m * BLOCK_M
+    start_n = off_n * BLOCK_N
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    Out += off_b.to(tl.int64) * stride_ob
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    out_ptrs = Out + offs_m[None, :] * stride_on + offs_n[:, None] * stride_om
+
+    JaggedA += seq_start * stride_ak
+    JaggedB += seq_start * stride_bk
+
+    num_k_blocks = cdiv_fn(seq_len, BLOCK_K)
+    num_k_blocks_per_split = cdiv_fn(num_k_blocks, SPLIT_K)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+    offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
+    jg_a_ptrs = (
+        JaggedA
+        + (offs_k[None, :] + off_k * num_k_blocks_per_split * BLOCK_K) * stride_ak
+        + offs_m[:, None]
+    )
+    jg_b_ptrs = (
+        JaggedB
+        + (offs_k[:, None] + off_k * num_k_blocks_per_split * BLOCK_K) * stride_bk
+        + offs_n[None, :]
+    )
+    actual_num_k_blocks_per_split = num_k_blocks_per_split
+    if off_k == tl.num_programs(0) - 1:
+        actual_num_k_blocks_per_split = min(
+            num_k_blocks - off_k * num_k_blocks_per_split, num_k_blocks_per_split
+        )
+
+    for k in range(0, actual_num_k_blocks_per_split):
+        offs_k_block = offs_k + (k + off_k * num_k_blocks_per_split) * BLOCK_K
+
+        jg_a = tl.load(
+            jg_a_ptrs,
+            mask=(offs_m[:, None] < M) and (offs_k_block[None, :] < seq_len),
+            other=0.0,
+        )
+        jg_b = tl.load(
+            jg_b_ptrs,
+            mask=(offs_n[None, :] < N) and (offs_k_block[:, None] < seq_len),
+            other=0.0,
+        )
+
+        accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
+
+        jg_a_ptrs += BLOCK_K * stride_ak
+        jg_b_ptrs += BLOCK_K * stride_bk
+
+    out = accumulator.to(Out.dtype.element_ty)
+    tl.atomic_add(
+        out_ptrs,
+        out.T,
+        mask=(offs_n[:, None] < N) & (offs_m[None, :] < M),
+        sem="relaxed",
+    )
 
 
 @triton_autotune(
@@ -2938,3 +3059,58 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
             None,  # activation_checkpointing
             None,  # has_silu
         )
+
+
+def triton_jagged_bmm_reduce_sum_split_k(
+    JaggedA: torch.Tensor,  # (sum_B(K_i), M)
+    JaggedB: torch.Tensor,  # (sum_B(K_i), N)
+    offsets: torch.Tensor,  # (B+1)
+    reduce_sum: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # d_weight: (B, M, N), d_bias: (B, N)
+    dtype = JaggedA.dtype
+    device = JaggedA.device
+    B = offsets.shape[0] - 1
+    M = JaggedA.shape[1]
+    N = JaggedB.shape[1]
+    d_weight = torch.zeros((B, M, N), dtype=dtype, device=device)
+    grid = lambda meta: (  # noqa E731
+        meta["SPLIT_K"],
+        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+        B,
+    )
+
+    _jagged_jagged_bmm_split_k[grid](
+        seq_offsets=offsets,
+        JaggedA=JaggedA,
+        JaggedB=JaggedB,
+        Out=d_weight,
+        M=M,
+        N=N,
+        # To avoid use max_seq_len here, we use total seq length as the max_seq_len
+        AUTOTUNE_K=triton.next_power_of_2(JaggedA.shape[0]),
+        stride_ak=JaggedA.stride(0),
+        stride_bk=JaggedB.stride(0),
+        stride_ob=d_weight.stride(0),
+        stride_om=d_weight.stride(2),
+        stride_on=d_weight.stride(1),
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+    )
+
+    d_bias = None
+    if reduce_sum:
+        d_bias = torch.empty((B, N), dtype=dtype, device=device)
+        grid = lambda meta: (  # noqa E731
+            B,
+            triton.cdiv(N, meta["BLOCK_M"]),
+        )
+        _jagged_reduce_sum[grid](
+            seq_offsets=offsets,
+            Jagged=JaggedB,
+            ReduceOut=d_bias,
+            M=N,
+            N=triton.next_power_of_2(JaggedB.shape[0]),
+            stride_jm=JaggedB.stride(1),
+            stride_jn=JaggedB.stride(0),
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+    return d_weight, d_bias

@@ -86,6 +86,7 @@ class MOETest(unittest.TestCase):
             else [torch.float32]
         ),
         d_weight_optimize=st.booleans(),
+        use_split_k=st.booleans(),
         contiguous=st.booleans(),
         has_bias=st.booleans(),
         allow_tf32=st.sampled_from([False]),
@@ -98,8 +99,10 @@ class MOETest(unittest.TestCase):
     # pyre-ignore[2]
     def test_index_select_jagged_bmm_triton_d_weight(self, *args, **kwargs) -> None:
         d_weight_optimize = kwargs.pop("d_weight_optimize")
+        use_split_k = kwargs.pop("use_split_k")
         triton_option = IndexSelectJaggedBmmOption(
-            d_weight_optimization=d_weight_optimize
+            d_weight_optimization=d_weight_optimize,
+            d_weight_split_k_kernel=use_split_k,
         )
         self._test_index_select_jagged_bmm(
             *args,

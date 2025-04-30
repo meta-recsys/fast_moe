@@ -78,6 +78,29 @@ def get_bmm_configs() -> List[triton.Config]:
     return configs
 
 
+def get_bmm_split_k_configs() -> List[triton.Config]:
+    configs = []
+    for BLOCK_M in [64, 128]:
+        for BLOCK_N in [64, 128]:
+            for BLOCK_K in [32, 64]:
+                for SPLIT_K in [1, 2, 4, 8, 16]:
+                    for num_stages in [2, 3]:
+                        for num_warps in [4, 8]:
+                            configs.append(
+                                triton.Config(
+                                    {
+                                        "BLOCK_M": BLOCK_M,
+                                        "BLOCK_N": BLOCK_N,
+                                        "BLOCK_K": BLOCK_K,
+                                        "SPLIT_K": SPLIT_K,
+                                    },
+                                    num_stages=num_stages,
+                                    num_warps=num_warps,
+                                )
+                            )
+    return configs
+
+
 def _get_rowwise_quant_fp8_configs() -> List[triton.Config]:
     configs = []
     for BLOCK_M in [16, 32, 64, 128]:
