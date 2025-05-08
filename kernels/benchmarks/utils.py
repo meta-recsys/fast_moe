@@ -70,7 +70,7 @@ class suppress_stdout_stderr(object):
 
 
 def get_kernel(provider: str) -> KernelType:
-    if provider in ["triton", "triton_split_k"]:
+    if provider in ["triton", "triton_split_k", "triton_split_k_tma"]:
         return KernelType.TRITON
     elif provider == "pytorch":
         return KernelType.PYTORCH

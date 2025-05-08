@@ -32,9 +32,13 @@ class IndexSelectJaggedBMMModule(torch.nn.Module):
         weight: torch.Tensor,
         bias: torch.Tensor,
     ) -> torch.Tensor:
-        if provider in ["triton", "triton_split_k", "pytorch"]:
+        if provider in ["triton", "triton_split_k", "triton_split_k_tma", "pytorch"]:
             if provider == "triton_split_k":
                 option = IndexSelectJaggedBmmOption(d_weight_split_k_kernel=True)
+            elif provider == "triton_split_k_tma":
+                option = IndexSelectJaggedBmmOption(
+                    d_weight_split_k_kernel_tma=True, d_weight_split_k_kernel=True
+                )
             else:
                 option = IndexSelectJaggedBmmOption()
             return index_select_jagged_bmm(  # noqa E731

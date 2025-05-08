@@ -34,6 +34,7 @@ class IndexSelectJaggedBmmOption:
     d_jagged_gemm_out_type: torch.dtype = torch.float32
     d_weight_optimization: bool = True
     d_weight_split_k_kernel: bool = False
+    d_weight_split_k_kernel_tma: bool = False
 
 
 @torch.fx.wrap
@@ -640,12 +641,13 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
             jagged_a = triton_index_select(
                 jagged, index.flatten() // index.shape[1]
             )  # [L * A, K]
-            if option.d_weight_split_k_kernel:
+            if option.d_weight_split_k_kernel or option.d_weight_split_k_kernel_tma:
                 d_weight, d_bias = triton_jagged_bmm_reduce_sum_split_k(
                     JaggedA=jagged_a,  # [L * A, K]
                     JaggedB=d_out,  # [L * A, N]
                     offsets=offsets,  # [E + 1]
                     reduce_sum=bias is not None,
+                    use_tma=option.d_weight_split_k_kernel_tma,
                 )  # [E, K, N], [E, N]
             else:
                 d_weight, d_bias = triton_jagged_bmm_reduce_sum(
@@ -1546,7 +1548,7 @@ def cdiv_fn(x, y):
 
 @triton_autotune(
     configs=get_bmm_split_k_configs(),
-    key=["M", "N", "AUTOTUNE_K"],
+    key=["M", "N", "AUTOTUNE_K", "USE_TMA"],
     restore_value=["Out"],
 )
 @triton.jit
@@ -1563,24 +1565,25 @@ def _jagged_jagged_bmm_split_k(
     stride_ob,
     stride_om,
     stride_on,
+    workspace_ptr,
     ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     """
     Computing bmm Out = Jagged x Jagged
     K is the jagged dimension
     JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), and Out has shape (B, M, N)
     """
+    off_k = tl.program_id(0)
 
     off_mn = tl.program_id(1)
     num_n_blocks = cdiv_fn(N, BLOCK_N)
     off_m = off_mn // num_n_blocks
     off_n = off_mn % num_n_blocks
-
-    off_k = tl.program_id(0)
 
     off_b = tl.program_id(2)
 
@@ -1588,66 +1591,137 @@ def _jagged_jagged_bmm_split_k(
     seq_end = tl.load(seq_offsets + off_b + 1)
     seq_len = seq_end - seq_start
 
+    num_k_blocks = cdiv_fn(seq_len, BLOCK_K)
+    num_k_blocks_per_split = cdiv_fn(num_k_blocks, SPLIT_K)
+    k_start = off_k * num_k_blocks_per_split * BLOCK_K
+
     start_m = off_m * BLOCK_M
     start_n = off_n * BLOCK_N
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    Out += off_b.to(tl.int64) * stride_ob
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    offs_n = start_n + tl.arange(0, BLOCK_N)
-    out_ptrs = Out + offs_m[None, :] * stride_on + offs_n[:, None] * stride_om
 
+    Out += off_b.to(tl.int64) * stride_ob
     JaggedA += seq_start * stride_ak
     JaggedB += seq_start * stride_bk
 
-    num_k_blocks = cdiv_fn(seq_len, BLOCK_K)
-    num_k_blocks_per_split = cdiv_fn(num_k_blocks, SPLIT_K)
-    offs_k = tl.arange(0, BLOCK_K)
-    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
-    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
-    offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
-    jg_a_ptrs = (
-        JaggedA
-        + (offs_k[None, :] + off_k * num_k_blocks_per_split * BLOCK_K) * stride_ak
-        + offs_m[:, None]
-    )
-    jg_b_ptrs = (
-        JaggedB
-        + (offs_k[:, None] + off_k * num_k_blocks_per_split * BLOCK_K) * stride_bk
-        + offs_n[None, :]
-    )
     actual_num_k_blocks_per_split = num_k_blocks_per_split
     if off_k == tl.num_programs(0) - 1:
         actual_num_k_blocks_per_split = min(
             num_k_blocks - off_k * num_k_blocks_per_split, num_k_blocks_per_split
         )
 
+    desc_a, desc_b, desc_c = None, None, None
+    offs_m, offs_n, offs_k, out_ptrs = None, None, None, None
+
+    if USE_TMA:
+        tile_idx = (
+            off_k
+            + off_mn * tl.num_programs(0)
+            + off_b * tl.num_programs(0) * tl.num_programs(1)
+        )
+
+        TMA_SIZE: tl.constexpr = tl.constexpr(128)
+
+        workspace_base = workspace_ptr + tile_idx * TMA_SIZE * 3
+        desc_a = workspace_base
+        desc_b = workspace_base + TMA_SIZE  # + TMA_SIZE
+        desc_c = workspace_base + 2 * TMA_SIZE
+
+        # pyre-ignore
+        tl.extra.cuda.experimental_device_tensormap_create2d(
+            desc_ptr=desc_a,
+            global_address=JaggedA,
+            load_size=[BLOCK_K, BLOCK_M],
+            global_size=[seq_len.to(tl.int32), M],
+            element_ty=JaggedA.dtype.element_ty,
+        )
+        # pyre-ignore
+        tl.extra.cuda.experimental_device_tensormap_create2d(
+            desc_ptr=desc_b,
+            global_address=JaggedB,
+            load_size=[BLOCK_K, BLOCK_N],
+            global_size=[seq_len.to(tl.int32), N],
+            element_ty=JaggedB.dtype.element_ty,
+        )
+        # pyre-ignore
+        tl.extra.cuda.experimental_device_tensormap_create2d(
+            desc_ptr=desc_c,
+            global_address=Out,
+            load_size=[BLOCK_M, BLOCK_N],
+            global_size=[M, N],
+            element_ty=Out.dtype.element_ty,
+        )
+        # pyre-ignore
+        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(desc_a)
+        # pyre-ignore
+        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(desc_b)
+        # pyre-ignore
+        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(desc_c)
+
+    else:
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+        offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+        offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
+
     for k in range(0, actual_num_k_blocks_per_split):
-        offs_k_block = offs_k + (k + off_k * num_k_blocks_per_split) * BLOCK_K
+        if USE_TMA:
+            jg_a = tl._experimental_descriptor_load(
+                desc_a,
+                [
+                    (k_start + k * BLOCK_K).to(tl.int32),
+                    (start_m).to(tl.int32),
+                ],
+                [BLOCK_K, BLOCK_M],
+                JaggedA.dtype.element_ty,
+            )
+            jg_b = tl._experimental_descriptor_load(
+                desc_b,
+                [
+                    (k_start + k * BLOCK_K).to(tl.int32),
+                    (start_n).to(tl.int32),
+                ],
+                [BLOCK_K, BLOCK_N],
+                JaggedB.dtype.element_ty,
+            )
+        else:
+            offs_k_block = k_start + k * BLOCK_K + offs_k[:, None]
+            jg_a = tl.load(
+                JaggedA + offs_k_block * stride_ak + offs_m[None, :],
+                mask=(offs_m[None, :] < M) and (offs_k_block < seq_len),
+                other=0.0,
+            )
+            jg_b = tl.load(
+                JaggedB + offs_k_block * stride_bk + offs_n[None, :],
+                mask=(offs_n[None, :] < N) and (offs_k_block < seq_len),
+                other=0.0,
+            )
 
-        jg_a = tl.load(
-            jg_a_ptrs,
-            mask=(offs_m[:, None] < M) and (offs_k_block[None, :] < seq_len),
-            other=0.0,
-        )
-        jg_b = tl.load(
-            jg_b_ptrs,
-            mask=(offs_n[None, :] < N) and (offs_k_block[:, None] < seq_len),
-            other=0.0,
-        )
-
-        accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
-
-        jg_a_ptrs += BLOCK_K * stride_ak
-        jg_b_ptrs += BLOCK_K * stride_bk
+        accumulator += tl.dot(jg_a.T, jg_b, allow_tf32=ALLOW_TF32)
 
     out = accumulator.to(Out.dtype.element_ty)
-    tl.atomic_add(
-        out_ptrs,
-        out.T,
-        mask=(offs_n[:, None] < N) & (offs_m[None, :] < M),
-        sem="relaxed",
-    )
+
+    if USE_TMA:
+        tl._experimental_descriptor_store(
+            desc_c,
+            out,
+            [
+                start_m.to(tl.int32),
+                start_n.to(tl.int32),
+            ],
+            store_reduce="add",
+        )
+    else:
+        tl.atomic_add(
+            out_ptrs,
+            out,
+            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+            sem="relaxed",
+        )
 
 
 @triton_autotune(
@@ -3066,6 +3140,7 @@ def triton_jagged_bmm_reduce_sum_split_k(
     JaggedB: torch.Tensor,  # (sum_B(K_i), N)
     offsets: torch.Tensor,  # (B+1)
     reduce_sum: bool = True,
+    use_tma: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # d_weight: (B, M, N), d_bias: (B, N)
     dtype = JaggedA.dtype
     device = JaggedA.device
@@ -3079,6 +3154,20 @@ def triton_jagged_bmm_reduce_sum_split_k(
         B,
     )
 
+    if use_tma:
+        max_num_tiles = 64 * triton.cdiv(M, 64) * triton.cdiv(N, 64) * B
+        TMA_SIZE = 128
+        workspace_ptr = torch.empty(
+            max_num_tiles * 3 * TMA_SIZE,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+    else:
+        workspace_ptr = None
+
+    assert JaggedA.stride(0) == JaggedA.shape[1]
+    assert JaggedB.stride(0) == JaggedB.shape[1]
+
     _jagged_jagged_bmm_split_k[grid](
         seq_offsets=offsets,
         JaggedA=JaggedA,
@@ -3091,9 +3180,11 @@ def triton_jagged_bmm_reduce_sum_split_k(
         stride_ak=JaggedA.stride(0),
         stride_bk=JaggedB.stride(0),
         stride_ob=d_weight.stride(0),
-        stride_om=d_weight.stride(2),
-        stride_on=d_weight.stride(1),
+        stride_om=d_weight.stride(1),
+        stride_on=d_weight.stride(2),
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        workspace_ptr=workspace_ptr,
+        USE_TMA=use_tma,
     )
 
     d_bias = None

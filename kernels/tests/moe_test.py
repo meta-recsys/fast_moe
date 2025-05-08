@@ -87,6 +87,7 @@ class MOETest(unittest.TestCase):
         ),
         d_weight_optimize=st.booleans(),
         use_split_k=st.booleans(),
+        use_split_k_tma=st.booleans(),
         contiguous=st.booleans(),
         has_bias=st.booleans(),
         allow_tf32=st.sampled_from([False]),
@@ -100,9 +101,11 @@ class MOETest(unittest.TestCase):
     def test_index_select_jagged_bmm_triton_d_weight(self, *args, **kwargs) -> None:
         d_weight_optimize = kwargs.pop("d_weight_optimize")
         use_split_k = kwargs.pop("use_split_k")
+        use_split_k_tma = kwargs.pop("use_split_k_tma")
         triton_option = IndexSelectJaggedBmmOption(
             d_weight_optimization=d_weight_optimize,
             d_weight_split_k_kernel=use_split_k,
+            d_weight_split_k_kernel_tma=use_split_k_tma,
         )
         self._test_index_select_jagged_bmm(
             *args,
