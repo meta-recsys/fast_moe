@@ -1797,6 +1797,96 @@ def _jagged_reduce_sum(
     tl.store(out_reduce_ptrs, out, mask=(offs_m[:] < M))
 
 
+@triton_autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_M": BLOCK_M,
+                "BLOCK_N": BLOCK_N,
+                "SPLIT_K": SPLIT_K,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_M in [32, 64, 128]
+        for BLOCK_N in [32, 64, 128]
+        for SPLIT_K in [1, 2, 4, 8, 16]
+        for num_stages in [2, 3]
+        for num_warps in [4, 8]
+    ],
+    key=["M", "N"],
+    restore_value=["ReduceOut"],
+)
+@triton.jit
+def _jagged_reduce_sum_split_k(
+    seq_offsets,
+    Jagged,
+    ReduceOut,
+    M,
+    N,
+    stride_jm,
+    stride_jn,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    off_k = tl.program_id(0)
+    off_m = tl.program_id(1)
+    off_b = tl.program_id(2)
+
+    seq_start = tl.load(seq_offsets + off_b)
+    seq_end = tl.load(seq_offsets + off_b + 1)
+    seq_len = seq_end - seq_start
+
+    start_m = off_m * BLOCK_M
+
+    accum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
+
+    jg_ptrs = (
+        Jagged
+        + seq_start.to(tl.int64) * stride_jn
+        + offs_m.to(tl.int64)[:, None] * stride_jm
+        + offs_n[None, :].to(tl.int64) * stride_jn,
+    )
+
+    out_reduce_ptrs = ReduceOut + off_b * M + offs_m
+
+    num_k_blocks = cdiv_fn(seq_len, BLOCK_N)
+    num_k_blocks_per_split = cdiv_fn(num_k_blocks, SPLIT_K)
+    k_start = off_k * num_k_blocks_per_split * BLOCK_N
+
+    actual_num_k_blocks_per_split = num_k_blocks_per_split
+    if off_k == tl.num_programs(0) - 1:
+        actual_num_k_blocks_per_split = min(
+            num_k_blocks - off_k * num_k_blocks_per_split, num_k_blocks_per_split
+        )
+
+    jg_ptrs += k_start * stride_jn
+    # for k in range(0, seq_len, BLOCK_N):
+    for k in range(0, actual_num_k_blocks_per_split):
+        jg = tl.load(
+            jg_ptrs,
+            mask=(offs_m[:, None] < M) and ((offs_n[None, :] + k * BLOCK_N) < seq_len),
+            other=0.0,
+        )
+
+        accum += jg
+        jg_ptrs += BLOCK_N * stride_jn
+
+    _accum = tl.sum(accum, axis=1)
+    out = _accum.to(ReduceOut.dtype.element_ty)
+
+    tl.atomic_add(out_reduce_ptrs, out, mask=(offs_m[:] < M))
+
+
 def triton_jagged_bmm_reduce_sum(
     JaggedA: torch.Tensor,  # (sum_B(K_i), M)
     JaggedB: torch.Tensor,  # (sum_B(K_i), N)
@@ -3189,12 +3279,13 @@ def triton_jagged_bmm_reduce_sum_split_k(
 
     d_bias = None
     if reduce_sum:
-        d_bias = torch.empty((B, N), dtype=dtype, device=device)
+        d_bias = torch.zeros((B, N), dtype=dtype, device=device)
         grid = lambda meta: (  # noqa E731
-            B,
+            meta["SPLIT_K"],
             triton.cdiv(N, meta["BLOCK_M"]),
+            B,
         )
-        _jagged_reduce_sum[grid](
+        _jagged_reduce_sum_split_k[grid](
             seq_offsets=offsets,
             Jagged=JaggedB,
             ReduceOut=d_bias,
