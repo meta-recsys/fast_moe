@@ -31,6 +31,7 @@ from torch.autograd.profiler import record_function
 @dataclasses.dataclass
 class IndexSelectJaggedBmmOption:
     d_jagged_use_grouped_gemm: bool = True
+    d_jagged_use_wrap_specialization: bool = True
     d_jagged_gemm_out_type: torch.dtype = torch.float32
     d_weight_optimization: bool = True
     d_weight_split_k_kernel: bool = False
@@ -438,6 +439,10 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         """
         if option is None:
             option = IndexSelectJaggedBmmOption()
+        if not torch.cuda.get_device_capability() >= (9, 0):
+            # TMA and warp specialization are only supported on Hopper and above
+            option.d_jagged_use_wrap_specialization = False
+            option.d_weight_split_k_kernel_tma = False
 
         index = switch_to_contiguous_if_needed(index)
         jagged = switch_to_contiguous_if_needed(jagged)
@@ -586,7 +591,7 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
                 m_sizes=m_sizes,  # [E]
                 use_fast_accum=False,
                 allow_tf32=torch.backends.cuda.matmul.allow_tf32,
-                _use_warp_specialization=True,
+                _use_warp_specialization=option.d_jagged_use_wrap_specialization,
                 _out_type=option.d_jagged_gemm_out_type,
                 _out_index=index.flatten(),
             )  # [L * A, K]

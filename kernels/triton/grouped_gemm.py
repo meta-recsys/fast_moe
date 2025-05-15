@@ -796,6 +796,16 @@ def _grouped_gemm(
     USE_TMA_STORE = False
     INDEX_STORE = out_index is not None
 
+    if (
+        USE_TMA_LOAD or USE_TMA_STORE or use_warp_specialization
+    ) and not torch.cuda.get_device_capability() >= (9, 0):
+        USE_TMA_LOAD = False
+        USE_TMA_STORE = False
+        use_warp_specialization = False
+        logging.warning(
+            "TMA and warp specialization is disabled as it must be run on Hopper+ GPU!"
+        )
+
     if USE_TMA_LOAD and not utils.HAS_TMA_DESC:
         USE_TMA_LOAD = False
         logging.warning("TMA load is disabled as there is no TMA descriptor support!")
