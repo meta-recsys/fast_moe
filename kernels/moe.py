@@ -9,6 +9,7 @@ from fast_moe.kernels.pytorch.moe import (
     pytorch_index_select_jagged_bmm,
     pytorch_index_select_jagged_bmm_3D,
     pytorch_index_select_jagged_bmm_swiglu,
+    pytorch_index_select_jagged_gating_bmm,
     pytorch_mul_merge_k_add,
     pytorch_silu_jagged_bmm_combine,
 )
@@ -18,6 +19,7 @@ from fast_moe.kernels.triton.triton_moe import (
     triton_index_select_jagged_bmm_3D_wrapper,
     triton_index_select_jagged_bmm_swiglu_wrapper,
     triton_index_select_jagged_bmm_wrapper,
+    triton_index_select_jagged_gating_bmm_wrapper,
     triton_mul_merge_k_add_wrapper,
     triton_silu_jagged_bmm_combine_wrapper,
 )
@@ -179,6 +181,50 @@ def index_select_jagged_bmm_swiglu(
             bias=bias,
             weight_p=weight_p,
             bias_p=bias_p,
+        )
+
+
+def index_select_jagged_gating_bmm(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged_a: torch.Tensor,
+    jagged_b: torch.Tensor,
+    weight_a: torch.Tensor,
+    bias_a: Optional[torch.Tensor],
+    weight_b: torch.Tensor,
+    bias_b: Optional[torch.Tensor],
+    kernel: KernelType = KernelType.PYTORCH,
+) -> torch.Tensor:
+    if not is_fx_tracing():
+        assert (
+            index.ndim == 2
+            and index.shape[0] == jagged_a.shape[0] == jagged_b.shape[0]
+            and jagged_a.shape == jagged_b.shape
+            and weight_a.shape == weight_b.shape
+        )
+    if kernel == KernelType.TRITON:
+        return triton_index_select_jagged_gating_bmm_wrapper(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            index=index,
+            jagged_a=jagged_a,
+            jagged_b=jagged_b,
+            weight_a=weight_a,
+            bias_a=bias_a,
+            weight_b=weight_b,
+            bias_b=bias_b,
+        )
+    else:
+        return pytorch_index_select_jagged_gating_bmm(
+            offsets=offsets,
+            index=index,
+            jagged_a=jagged_a,
+            jagged_b=jagged_b,
+            weight_a=weight_a,
+            bias_a=bias_a,
+            weight_b=weight_b,
+            bias_b=bias_b,
         )
 
 

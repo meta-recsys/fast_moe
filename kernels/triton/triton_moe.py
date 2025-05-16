@@ -2396,6 +2396,492 @@ def _index_select_jagged_bmm_swiglu(
     )
 
 
+@torch.fx.wrap
+def triton_index_select_jagged_gating_bmm(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged_a: torch.Tensor,
+    jagged_b: torch.Tensor,
+    weight_a: torch.Tensor,
+    weight_b: torch.Tensor,
+    bias_a: Optional[torch.Tensor],
+    bias_b: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return IndexSelectJaggedGatingBmm.apply(
+        max_seq_len,
+        offsets,
+        index,
+        jagged_a,
+        jagged_b,
+        weight_a,
+        weight_b,
+        bias_a,
+        bias_b,
+    )
+
+
+def triton_index_select_jagged_gating_bmm_wrapper(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged_a: torch.Tensor,
+    jagged_b: torch.Tensor,
+    weight_a: torch.Tensor,
+    weight_b: torch.Tensor,
+    bias_a: Optional[torch.Tensor],
+    bias_b: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return triton_index_select_jagged_gating_bmm(
+        max_seq_len=max_seq_len,
+        offsets=offsets,
+        index=index,
+        jagged_a=jagged_a,
+        jagged_b=jagged_b,
+        weight_a=weight_a,
+        weight_b=weight_b,
+        bias_a=bias_a,
+        bias_b=bias_b,
+    )
+
+
+class IndexSelectJaggedGatingBmm(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        max_seq_len: int,
+        offsets: torch.Tensor,
+        index: torch.Tensor,
+        jagged_a: torch.Tensor,
+        jagged_b: torch.Tensor,
+        weight_a: torch.Tensor,
+        weight_b: torch.Tensor,
+        bias_a: Optional[torch.Tensor],
+        bias_b: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            max_seq_len (int): Maximum number of input tokens for any expert.
+            offsets (torch.Tensor): A tensor of shape [E + 1] representing the cumulative number of tokens dispatched to each expert.
+            index (torch.Tensor): A tensor of shape [L, A] that is flattened and sorted by expert.
+            jagged_a (torch.Tensor): A tensor of shape [L, K] representing the input tokens.
+            jagged_b (torch.Tensor): A tensor of shape [L, K] representing the input tokens.
+            weight_a (torch.Tensor): A tensor of shape [E, K, N] containing the weights for each expert.
+            weight_b (torch.Tensor): A tensor of shape [E, K, N] containing the weights for each expert.
+            bias_a (torch.Tensor): A tensor of shape [E, N] containing the biases for each expert.
+            bias_b (torch.Tensor): A tensor of shape [E, N] containing the biases for each expert.
+        Returns:
+            torch.Tensor: A tensor of shape [L * A, N] containing the output after applying the linear transformation.
+        """
+        index = switch_to_contiguous_if_needed(index)
+        jagged_a = switch_to_contiguous_if_needed(jagged_a)
+        jagged_b = switch_to_contiguous_if_needed(jagged_b)
+        if bias_a is not None:
+            bias_a = switch_to_contiguous_if_needed(bias_a)
+        if bias_b is not None:
+            bias_b = switch_to_contiguous_if_needed(bias_b)
+
+        # L: number of input tokens
+        # A: number of activated experts
+        # E: number of total experts
+        # K: input dimension
+        # N: output dimension
+        L, A = index.shape
+        _, K = jagged_a.shape
+        E, _, N = weight_a.shape
+        output = torch.empty(
+            (L * A, N), dtype=jagged_a.dtype, device=jagged_a.device
+        )  # [L * A, N]
+        alpha = torch.empty(
+            (L * A, N), dtype=jagged_a.dtype, device=jagged_a.device
+        )  # [L * A, N]
+        alpha_silu = torch.empty(
+            (L * A, N), dtype=jagged_a.dtype, device=jagged_a.device
+        )  # [L * A, N]
+        beta = torch.empty(
+            (L * A, N), dtype=jagged_b.dtype, device=jagged_b.device
+        )  # [L * A, N]
+
+        grid = lambda meta: (  # noqa E731
+            E,
+            triton.cdiv(max_seq_len, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+        _index_select_jagged_gating_bmm[grid](
+            seq_offsets=offsets,
+            Index=index,
+            Jagged_A=jagged_a,
+            Jagged_B=jagged_b,
+            Dense_A=weight_a,
+            Dense_B=weight_b,
+            Bias_A=bias_a,
+            Bias_B=bias_b,
+            Out=output,
+            ALPHA=alpha,
+            ALPHA_SILU=alpha_silu,
+            BETA=beta,
+            # M is only used for trigger autotune
+            M=triton.next_power_of_2(max_seq_len),
+            N=N,
+            K=K,
+            A=A,
+            stride_jm=jagged_a.stride(0),
+            stride_db=weight_a.stride(0),
+            stride_dk=weight_a.stride(1),
+            stride_dn=weight_a.stride(2),
+            stride_bias_b=bias_a.stride(0) if bias_a is not None else 0,
+            stride_om=output.stride(0),
+            HAS_BIAS=bias_a is not None,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        )
+
+        ctx.save_for_backward(
+            offsets,
+            index,
+            jagged_a,
+            jagged_b,
+            weight_a,
+            weight_b,
+            bias_a,
+            bias_b,
+            alpha,
+            alpha_silu,
+            beta,
+        )
+        ctx.E = E
+        ctx.max_seq_len = max_seq_len
+        ctx.L = L
+        ctx.A = A
+        ctx.K = K
+        ctx.N = N
+
+        return output
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx,
+        d_out: torch.Tensor,
+    ) -> Tuple[
+        None,
+        None,
+        None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        """
+        Args:
+            d_out (torch.Tensor): A tensor of shape [L * A, N] representing the gradient of the output.
+        Returns:
+            Tuple[None, None, None, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - None: No gradient is computed for `max_seq_len`.
+                - None: No gradient is computed for `offsets`.
+                - None: No gradient is computed for `index`.
+                - torch.Tensor: Gradient with respect to `jagged_a`, of shape [L, K].
+                - torch.Tensor: Gradient with respect to `jagged_b`, of shape [L, K].
+                - torch.Tensor: Gradient with respect to `weight_a`, of shape [E, K, N].
+                - torch.Tensor: Gradient with respect to `weight_b`, of shape [E, K, N].
+                - torch.Tensor: Gradient with respect to `bias_a`, of shape [E, N].
+                - torch.Tensor: Gradient with respect to `bias_b`, of shape [E, N].
+        """
+        # offsets: [E + 1]
+        # index: [L, A]
+        # jagged_a: [L, K]
+        # jagged_b: [L, K]
+        # weight_a: [E, K, N]
+        # bias_a: [E, N]
+        # weight_b: [E, K, N]
+        # bias_b: [E, N]
+        # a: [L * A, N]
+        # beta: [L * A, N]
+        (
+            offsets,
+            index,
+            jagged_a,
+            jagged_b,
+            weight_a,
+            weight_b,
+            bias_a,
+            bias_b,
+            a,
+            alpha,
+            beta,
+        ) = ctx.saved_tensors
+        _, K, L, A, N = ctx.E, ctx.K, ctx.L, ctx.A, ctx.N
+        has_bias = bias_a is not None
+
+        d_alpha = d_out * beta
+        d_beta = d_out * alpha
+
+        d_a = triton_silu_backward(a, d_alpha)
+
+        d_jagged_expanded_1 = torch.empty(
+            (jagged_a.shape[0], index.shape[1], jagged_a.shape[1]),
+            device=jagged_a.device,
+            dtype=torch.float32,
+        )  # [L, A, K]
+        d_jagged_expanded_2 = torch.empty(
+            (jagged_b.shape[0], index.shape[1], jagged_b.shape[1]),
+            device=jagged_b.device,
+            dtype=torch.float32,
+        )  # [L, A, K]
+        # tensors below needs to be initialized with zeros as there could be unused
+        # rows in the weight and bias
+        d_weight_a = torch.zeros_like(weight_a)  # [E, K, N]
+        d_weight_b = torch.zeros_like(weight_b)  # [E, K, N]
+        if has_bias:
+            d_bias_a = torch.zeros_like(bias_a)  # [E, N]
+            d_bias_b = torch.zeros_like(bias_b)  # [E, N]
+        else:
+            d_bias_a = None
+            d_bias_b = None
+
+        jagged_a_selected = triton_index_select(
+            jagged_a, index.flatten() // index.shape[1]
+        )  # [L * A, K]
+        jagged_b_selected = triton_index_select(
+            jagged_b, index.flatten() // index.shape[1]
+        )  # [L * A, K]
+        d_weight_a, d_bias_a = triton_jagged_bmm_reduce_sum(
+            JaggedA=jagged_a_selected,  # [L * A, K]
+            JaggedB=d_a,  # [L * A, N]
+            offsets=offsets,  # [E + 1]
+            reduce_sum=bias_a is not None,
+        )  # [E, K, N], [E, N]
+
+        d_weight_b, d_bias_b = triton_jagged_bmm_reduce_sum(
+            JaggedA=jagged_b_selected,  # [L * A, K]
+            JaggedB=d_beta,  # [L * A, N]
+            offsets=offsets,  # [E + 1]
+            reduce_sum=bias_b is not None,
+        )  # [E, K, N], [E, N]
+
+        assert N % 64 == 0, "N must be a multiple of 64"
+        m_sizes = (offsets[1:] - offsets[:-1]).to(torch.int32)  # [E]
+        weight_a_grouped = weight_a.reshape(-1, N)  # [E, K, N] -> [E * K, N]
+        weight_b_grouped = weight_b.reshape(-1, N)  # [E, K, N] -> [E * K, N]
+        d_jagged_expanded_1 = grouped_gemm(
+            x=d_a,  # [L * A, N]
+            w=weight_a_grouped,  # [E * K, N]
+            m_sizes=m_sizes,  # [E]
+            use_fast_accum=False,
+            allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+            _use_warp_specialization=True,
+            _out_type=jagged_a.dtype,
+            _out_index=index.flatten(),
+        )  # [L * A, K]
+        d_jagged_expanded_1 = d_jagged_expanded_1.view((L, A, K))  # [L, A, K]
+
+        d_jagged_expanded_2 = grouped_gemm(
+            x=d_beta,  # [L * A, N]
+            w=weight_b_grouped,  # [E * K, N]
+            m_sizes=m_sizes,  # [E]
+            use_fast_accum=False,
+            allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+            _use_warp_specialization=True,
+            _out_type=jagged_b.dtype,
+            _out_index=index.flatten(),
+        )  # [L * A, K]
+        d_jagged_expanded_2 = d_jagged_expanded_2.view((L, A, K))  # [L, A, K]
+
+        d_jagged_a = triton_sum_dim1(d_jagged_expanded_1)
+        d_jagged_b = triton_sum_dim1(d_jagged_expanded_2)
+
+        return (
+            None,
+            None,
+            None,
+            d_jagged_a.to(jagged_a.dtype),
+            d_jagged_b.to(jagged_b.dtype),
+            d_weight_a,
+            d_weight_b,
+            d_bias_a,
+            d_bias_b,
+        )
+
+
+@triton_autotune(
+    configs=get_bmm_configs(),
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _index_select_jagged_gating_bmm(
+    seq_offsets,  # [B+1]
+    Index,  # [Sum_B(M)], jagged indices in range [0, L * A)
+    Jagged_A,  # [L, K]
+    Jagged_B,  # [L, K]
+    Dense_A,  # [B, K, N]
+    Dense_B,  # [B, K, N]
+    Bias_A,  # [B, N]
+    Bias_B,  # [B, N]
+    Out,  # [Sum_B(M), N]
+    ALPHA,  # [Sum_B(M), N]
+    ALPHA_SILU,  # [Sum_B(M), N]
+    BETA,  # [Sum_B(M), N]
+    M,
+    N,
+    K,
+    A,
+    stride_jm,
+    stride_db,
+    stride_dk,
+    stride_dn,
+    stride_bias_b,
+    stride_om,
+    HAS_BIAS: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    index_select_jagged_bmm with gating
+
+    Out = Silu(Jagged_A @ Dense_A + Bias_A) * (Jagged_B @ Dense_B + Bias_B)
+
+    Split the kernel into (b, m, n) grid, each program processes [BLOCK_M, BLOCK_N] output elements for specific b.
+    """
+    off_b = tl.program_id(0)
+    off_m = tl.program_id(1)
+    off_n = tl.program_id(2)
+
+    seq_start = tl.load(seq_offsets + off_b, eviction_policy="evict_last")
+    seq_end = tl.load(seq_offsets + off_b + 1, eviction_policy="evict_last")
+    seq_len = seq_end - seq_start  # Matrix size in M dimension for b-th matmul
+    start_m = off_m * BLOCK_M
+    start_n = off_n * BLOCK_N
+    if start_m >= seq_len:
+        return
+
+    Index += seq_start
+    Dense_A += off_b * stride_db
+    Dense_B += off_b * stride_db
+    Out += seq_start.to(tl.int64) * stride_om
+    ALPHA += seq_start.to(tl.int64) * stride_om
+    ALPHA_SILU += seq_start.to(tl.int64) * stride_om
+    BETA += seq_start.to(tl.int64) * stride_om
+
+    offs_m = start_m + tl.arange(0, BLOCK_M)  # [BLOCK_M]
+    offs_n = start_n + tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_k = tl.arange(0, BLOCK_K)  # [BLOCK_K]
+
+    # load index for all rows to be processed by this block
+    idx_ptrs = Index + offs_m
+    idx = tl.load(idx_ptrs, mask=offs_m < seq_len, other=0)  # [BLOCK_M]
+    idx = idx // A
+
+    # [BLOCK_M, BLOCK_K]
+    jg_a_ptrs = Jagged_A + idx[:, None] * stride_jm + offs_k[None, :]
+    # [BLOCK_M, BLOCK_K]
+    jg_b_ptrs = Jagged_B + idx[:, None] * stride_jm + offs_k[None, :]
+    # [BLOCK_K, BLOCK_N]
+    dn_a_ptrs = Dense_A + offs_k[:, None] * stride_dk + offs_n[None, :] * stride_dn
+    # [BLOCK_K, BLOCK_N]
+    dn_b_ptrs = Dense_B + offs_k[:, None] * stride_dk + offs_n[None, :] * stride_dn
+
+    accumulator1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  # [BLOCK_M, BLOCK_N]
+    accumulator2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)  # [BLOCK_M, BLOCK_N]
+    for k in range(0, K, BLOCK_K):
+        jga = tl.load(
+            jg_a_ptrs,
+            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
+            mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
+            other=0.0,
+        )  # [BLOCK_M, BLOCK_K]
+        jgb = tl.load(
+            jg_b_ptrs,
+            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
+            mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
+            other=0.0,
+        )  # [BLOCK_M, BLOCK_K]
+        dna = tl.load(
+            dn_a_ptrs,
+            mask=((k + offs_k)[:, None] < K) and (offs_n[None, :] < N),
+            other=0.0,
+            eviction_policy="evict_last",
+        )  # [BLOCK_K, BLOCK_N]
+        dnb = tl.load(
+            dn_b_ptrs,
+            mask=((k + offs_k)[:, None] < K) and (offs_n[None, :] < N),
+            other=0.0,
+            eviction_policy="evict_last",
+        )  # [BLOCK_K, BLOCK_N]
+
+        acc1 = tl.dot(jga, dna, allow_tf32=ALLOW_TF32)  # [BLOCK_M, BLOCK_N]
+        acc2 = tl.dot(jgb, dnb, allow_tf32=ALLOW_TF32)  # [BLOCK_M, BLOCK_N]
+        accumulator1 += acc1
+        accumulator2 += acc2
+        jg_a_ptrs += BLOCK_K
+        jg_b_ptrs += BLOCK_K
+
+        dn_a_ptrs += BLOCK_K * stride_dk
+        dn_b_ptrs += BLOCK_K * stride_dk
+
+    if HAS_BIAS:
+        # load bias
+        bias_a_ptrs = Bias_A + off_b * stride_bias_b + offs_n  # [BLOCK_N]
+        bias_b_ptrs = Bias_B + off_b * stride_bias_b + offs_n  # [BLOCK_N]
+
+        bias_a = tl.load(
+            bias_a_ptrs, mask=offs_n < N, eviction_policy="evict_last"
+        )  # [BLOCK_N]
+        bias_b = tl.load(
+            bias_b_ptrs, mask=offs_n < N, eviction_policy="evict_last"
+        )  # [BLOCK_N]
+
+        # add bias to accumulator [BLOCK_M, BLOCK_N]
+        A = accumulator1 + bias_a[None, :].to(tl.float32)
+        B = accumulator2 + bias_b[None, :].to(tl.float32)
+    else:
+        A = accumulator1
+        B = accumulator2
+
+    # Apply Silu to A
+    a_sigmoid = fast_sigmoid(A)
+    A_SILU = A * a_sigmoid
+
+    out = (A_SILU * B).to(Out.dtype.element_ty)
+
+    # write back [BLOCK_M, BLOCK_N]
+    out_ptrs = Out + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    alpha_ptrs = ALPHA + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    alpha_silu_ptrs = (
+        ALPHA_SILU + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    )
+    beta_ptrs = BETA + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
+    tl.store(
+        out_ptrs,
+        out,
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+    tl.store(
+        alpha_ptrs,
+        A.to(ALPHA.dtype.element_ty),
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+    tl.store(
+        alpha_silu_ptrs,
+        A_SILU.to(ALPHA_SILU.dtype.element_ty),
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+
+    tl.store(
+        beta_ptrs,
+        B.to(BETA.dtype.element_ty),
+        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+        eviction_policy="evict_first",
+    )
+
+
 @triton_autotune(
     configs=get_bmm_configs(),
     key=["AUTOTUNE_MAX_SEQ_LEN", "N", "K"],

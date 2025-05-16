@@ -314,7 +314,7 @@ def triton_jagged_reduce_sum(
         for num_stages in [2, 3]
         for num_warps in [4, 8]
     ],
-    key=["N"],
+    key=["AUTOTUNE_N"],
 )
 @triton.jit
 def _kernel_silu_backward(
@@ -322,6 +322,7 @@ def _kernel_silu_backward(
     dy_ptr,  # float*  : upstream grad dY
     dx_ptr,  # float*  : output grad dX
     N: tl.constexpr,
+    AUTOTUNE_N: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -348,5 +349,5 @@ def triton_silu_backward(x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     dx = torch.empty_like(x)
 
     grid = lambda meta: (triton.cdiv(n, meta["BLOCK_N"]),)  # noqa E731
-    _kernel_silu_backward[grid](x, dy, dx, n)
+    _kernel_silu_backward[grid](x, dy, dx, n, triton.next_power_of_2(n))
     return dx

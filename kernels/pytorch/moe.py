@@ -145,6 +145,81 @@ def pytorch_index_select_jagged_bmm_swiglu(
     return F.silu(alpha) * beta
 
 
+def pytorch_index_select_jagged_gating_bmm(
+    offsets: torch.Tensor,
+    index: torch.Tensor,
+    jagged_a: torch.Tensor,
+    jagged_b: torch.Tensor,
+    weight_a: torch.Tensor,
+    weight_b: torch.Tensor,
+    bias_a: Optional[torch.Tensor],
+    bias_b: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Out = Silu(Jagged_A @ Dense_A + Bias_A) * (Jagged_B @ Dense_B + Bias_B)
+
+    Dimensions:
+        L: number of input tokens
+        E: number of total experts
+        A: number of activated experts
+        K: input dimension
+        N: output dimension
+    Args:
+        offsets (torch.Tensor): A tensor of shape [E+1] representing the cumulative number of tokens dispatched to each expert.
+        index (torch.Tensor): A tensor of shape [L, A] that is flattened and sorted by expert. Each entry is calculated as token_id * A + [0, A).
+        jagged_a (torch.Tensor): A tensor of shape [L, K] representing the input tokens.
+        jagged_b (torch.Tensor): A tensor of shape [L, K] representing the input tokens.
+        weight_a (torch.Tensor): A tensor of shape [E, K, N] containing the weights for each expert.
+        weight_b (torch.Tensor): A tensor of shape [E, K, N] containing the weights for each expert.
+        bias_a (torch.Tensor): A tensor of shape [E, N] containing the biases for each expert.
+        bias_b (torch.Tensor): A tensor of shape [E, N] containing the biases for each expert.
+    Returns:
+        torch.Tensor: A tensor of shape [L*A, N] containing the output after applying the linear transformation for each expert's tokens.
+    """
+
+    weight_a_t = weight_a.permute(0, 2, 1)  # [E, N, K]
+    weight_b_t = weight_b.permute(0, 2, 1)  # [E, N, K]
+
+    # Calculate the number of tokens per expert
+    partition_sizes: List[int] = (offsets[1:] - offsets[:-1]).tolist()  # [E]
+    # Flatten index and map each element to its corresponding token index
+    index = index.view(-1) // index.shape[-1]  # [L*A]
+    # Gather tokens for each expert based on the index
+    jagged_a_list: List[torch.Tensor] = list(
+        jagged_a[index].contiguous().split(partition_sizes)
+    )  # list of tensors, each of shape [num_tokens_per_expert[i], K]
+    if jagged_a is jagged_b:
+        jagged_b_list = jagged_a_list
+    else:
+        jagged_b_list: List[torch.Tensor] = list(
+            jagged_b[index].contiguous().split(partition_sizes)
+        )  # list of tensors, each of shape [num_tokens_per_expert[i], K]
+
+    # Apply a linear transformation for each expert's tokens
+    output_list: List[torch.Tensor] = [
+        F.linear(
+            jagged_a_list[i],
+            weight_a_t[i],
+            bias_a[i] if bias_a is not None else None,
+        )
+        for i in range(len(jagged_a_list))
+    ]  # list of tensors, each of shape [num_tokens_per_expert[i], N]
+    output_list_p: List[torch.Tensor] = [
+        F.linear(
+            jagged_b_list[i],
+            weight_b_t[i],
+            bias_b[i] if bias_b is not None else None,
+        )
+        for i in range(len(jagged_b_list))
+    ]
+
+    # Concatenate the outputs from all experts to form the final output tensor
+    alpha = torch.cat(output_list, dim=0)  # [L*A, N]
+    beta = torch.cat(output_list_p, dim=0)  # [L*A, N]
+
+    return F.silu(alpha) * beta
+
+
 def pytorch_index_select_jagged_bmm_3D(
     max_seq_len: int,
     offsets: torch.Tensor,
