@@ -321,8 +321,8 @@ def _kernel_silu_backward(
     x_ptr,  # float*  : forward‑input tensor
     dy_ptr,  # float*  : upstream grad dY
     dx_ptr,  # float*  : output grad dX
-    N: tl.constexpr,
-    AUTOTUNE_N: tl.constexpr,
+    N,
+    AUTOTUNE_N,
     BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
