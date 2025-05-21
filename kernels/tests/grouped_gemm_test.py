@@ -186,13 +186,14 @@ class TestGroupedGEMM(unittest.TestCase):
 
         for G in (1, 4, 16):
             for M in (0, 64, 512, 1000000):
-                for ws in (True, False):
-                    logging.info(
-                        f"Testing BF16 GMM with G={G}, M={M}, "
-                        f"UseWarpSpecialization={ws}"
-                    )
-                    _test_grouped_gemm_bf16(
-                        (G, M, 256, 256),
-                        torch.device("cuda"),
-                        use_warp_specialization=ws,
-                    )
+                for K in (29, 256):
+                    for ws in (True, False):
+                        logging.info(
+                            f"Testing BF16 GMM with G={G}, M={M}, K={K}, "
+                            f"UseWarpSpecialization={ws}"
+                        )
+                        _test_grouped_gemm_bf16(
+                            (G, M, 256, K),
+                            torch.device("cuda"),
+                            use_warp_specialization=ws,
+                        )

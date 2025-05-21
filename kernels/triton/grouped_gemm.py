@@ -155,7 +155,7 @@ def early_config_prune(configs, named_args, dtsize=None, dtype=None, **kwargs):
             continue
 
         # 6. make sure K can be evenly divided
-        if K % BLOCK_K != 0:
+        if use_warp_specialization and K % BLOCK_K != 0:
             continue
 
         # 7. make sure we can partition for ws
@@ -252,8 +252,8 @@ def _fbgemm_grouped_gemm(
                 tile_n_idx = gidx // num_m_tiles
 
                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-                tl.static_assert(K % BLOCK_SIZE_K == 0)
                 if USE_TMA_LOAD:
+                    tl.static_assert(K % BLOCK_SIZE_K == 0)
                     m_offset = (M_start_offset + tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (N_start_offset + tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
                     for k_offset in range(0, K, BLOCK_SIZE_K):
@@ -290,8 +290,14 @@ def _fbgemm_grouped_gemm(
                         + offs_k[None, :]
                     )
                     for k_offset in range(0, K, BLOCK_SIZE_K):
-                        a = tl.load(a_ptrs, mask=offs_am[:, None] < m_size)
-                        b = tl.load(b_ptrs, mask=offs_bn[:, None] < n_size)
+                        a = tl.load(
+                            a_ptrs,
+                            mask=offs_am[:, None] < m_size and offs_k[None, :] < K,
+                        )
+                        b = tl.load(
+                            b_ptrs,
+                            mask=offs_bn[:, None] < n_size and offs_k[None, :] < K,
+                        )
                         if USE_FAST_ACCUM:
                             accumulator = tl.dot(
                                 a, b.T, accumulator, allow_tf32=ALLOW_TF32
@@ -300,6 +306,7 @@ def _fbgemm_grouped_gemm(
                             accumulator += tl.dot(a, b.T, allow_tf32=ALLOW_TF32)
                         a_ptrs += BLOCK_SIZE_K
                         b_ptrs += BLOCK_SIZE_K
+                        offs_k += BLOCK_SIZE_K
 
                 if USE_TMA_STORE:
                     m_offset = (tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
@@ -837,6 +844,11 @@ def _grouped_gemm(
     y = torch.empty((M, N), device=x.device, dtype=out_type)
     if M == 0 or N == 0:
         return y
+
+    if K % 64 != 0:
+        USE_TMA_LOAD = False
+        use_warp_specialization = False
+        logging.info("TMA and warp specialization is disabled for K % 64 != 0!")
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
