@@ -3728,7 +3728,7 @@ def triton_jagged_bmm_reduce_sum_split_k(
     B = offsets.shape[0] - 1
     M = JaggedA.shape[1]
     N = JaggedB.shape[1]
-    d_weight = torch.zeros((B, M, N), dtype=dtype, device=device)
+    d_weight = torch.zeros((B, M, N), dtype=torch.float32, device=device)
     grid = lambda meta: (  # noqa E731
         meta["SPLIT_K"],
         triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
@@ -3767,10 +3767,11 @@ def triton_jagged_bmm_reduce_sum_split_k(
         workspace_ptr=workspace_ptr,
         USE_TMA=use_tma,
     )
+    d_weight = d_weight.to(dtype)
 
     d_bias = None
     if reduce_sum:
-        d_bias = torch.zeros((B, N), dtype=dtype, device=device)
+        d_bias = torch.zeros((B, N), dtype=torch.float32, device=device)
         grid = lambda meta: (  # noqa E731
             meta["SPLIT_K"],
             triton.cdiv(N, meta["BLOCK_M"]),
@@ -3786,4 +3787,5 @@ def triton_jagged_bmm_reduce_sum_split_k(
             stride_jn=JaggedB.stride(0),
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
+        d_bias = d_bias.to(dtype)
     return d_weight, d_bias
