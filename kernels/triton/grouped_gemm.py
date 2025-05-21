@@ -891,6 +891,8 @@ def _grouped_gemm(
         input_tl_dtype = tl.bfloat16
     elif x.dtype == torch.float32:
         input_tl_dtype = tl.float32
+    elif x.dtype == torch.float8_e4m3fn:
+        input_tl_dtype = tl.float8e4nv
     else:
         raise RuntimeError(f"Unsupported input dtype {x.dtype}")
 
