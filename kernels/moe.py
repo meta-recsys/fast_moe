@@ -16,6 +16,7 @@ from fast_moe.kernels.pytorch.moe import (
 
 from fast_moe.kernels.triton.triton_moe import (
     IndexSelectJaggedBmmOption,
+    SiluJaggedBmmCombineOption,
     triton_index_select_jagged_bmm_3D_wrapper,
     triton_index_select_jagged_bmm_swiglu_wrapper,
     triton_index_select_jagged_bmm_wrapper,
@@ -238,9 +239,9 @@ def silu_jagged_bmm_combine(
     reverse_index: torch.Tensor,
     gates: Optional[torch.Tensor] = None,
     gates_index: Optional[torch.Tensor] = None,
-    activation_checkpointing: bool = False,
     has_silu: bool = True,
     kernel: KernelType = KernelType.PYTORCH,
+    triton_option: Optional[SiluJaggedBmmCombineOption] = None,
 ) -> torch.Tensor:
     N = index.shape[0]
     L, K = reverse_index.shape
@@ -261,8 +262,8 @@ def silu_jagged_bmm_combine(
             k=K,
             gates=gates,
             gates_index=gates_index,
-            activation_checkpointing=activation_checkpointing,
             has_silu=has_silu,
+            option=triton_option,
         )
     elif kernel == KernelType.TRITON_CC:
         raise NotImplementedError(

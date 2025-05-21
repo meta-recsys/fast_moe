@@ -9,6 +9,7 @@ from fast_moe.kernels.benchmarks.utils import (
     TrainModuleBench,
 )
 from fast_moe.kernels.moe import silu_jagged_bmm_combine
+from fast_moe.kernels.triton.triton_moe import SiluJaggedBmmCombineOption
 
 # buck2 run @mode/{opt,inplace} //fast_moe/kernels/benchmarks:silu_jagged_bmm_combine_bench -- --provider triton --num-tokens 822171 -e 32 -k 4 -m 512 -n 256
 
@@ -43,9 +44,11 @@ class SiluJaggedBmmCombineModule(torch.nn.Module):
                 reverse_index=reverse_index,
                 gates=gates,
                 gates_index=gates_index,
-                activation_checkpointing=activation_checkpointing,
                 has_silu=has_silu,
                 kernel=get_kernel(provider),
+                triton_option=SiluJaggedBmmCombineOption(
+                    activation_checkpointing=activation_checkpointing
+                ),
             )
         else:
             raise ValueError(f"unsupported provider: {provider}")

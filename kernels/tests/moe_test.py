@@ -6,7 +6,10 @@ import unittest
 from typing import Optional
 
 import torch
-from fast_moe.kernels.triton.triton_moe import IndexSelectJaggedBmmOption
+from fast_moe.kernels.triton.triton_moe import (
+    IndexSelectJaggedBmmOption,
+    SiluJaggedBmmCombineOption,
+)
 from fast_moe.kernels.utils import (
     gpu_unavailable,
     KernelType,
@@ -27,7 +30,7 @@ class MOETest(unittest.TestCase):
         E=st.sampled_from([4, 8, 16]),
         K=st.sampled_from([2, 4]),
         D_in=st.sampled_from([32, 64]),
-        D_out=st.sampled_from([64, 128]),
+        D_out=st.sampled_from([32, 64, 128]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
@@ -79,7 +82,7 @@ class MOETest(unittest.TestCase):
         E=st.sampled_from([4, 8, 16]),
         K=st.sampled_from([2, 4]),
         D_in=st.sampled_from([32, 64]),
-        D_out=st.sampled_from([64, 128]),
+        D_out=st.sampled_from([32, 64, 128]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
@@ -1033,6 +1036,7 @@ class MOETest(unittest.TestCase):
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
     ) -> None:
+        set_dev_mode(True)
         from fast_moe.kernels.moe import silu_jagged_bmm_combine
 
         torch.cuda.manual_seed(0)
@@ -1098,6 +1102,9 @@ class MOETest(unittest.TestCase):
         bias_test = bias_base.detach().clone().requires_grad_() if has_bias else None
         gates_test = gates_base.detach().clone().requires_grad_()
 
+        triton_option = SiluJaggedBmmCombineOption(
+            activation_checkpointing=activation_checkpointing,
+        )
         out_base = silu_jagged_bmm_combine(
             max_seq_len=max_seq_len,
             offsets=offsets,
@@ -1108,9 +1115,9 @@ class MOETest(unittest.TestCase):
             reverse_index=reverse_index,
             gates=gates_base,
             gates_index=gates_index,
-            activation_checkpointing=activation_checkpointing,
             has_silu=has_silu,
             kernel=ref_kernel,
+            triton_option=triton_option,
         )
 
         out_test = silu_jagged_bmm_combine(
@@ -1123,9 +1130,9 @@ class MOETest(unittest.TestCase):
             reverse_index=reverse_index.to(device),
             gates=gates_test.to(device),
             gates_index=gates_index.to(device),
-            activation_checkpointing=activation_checkpointing,
             has_silu=has_silu,
             kernel=real_kernel,
+            triton_option=triton_option,
         )
 
         torch.testing.assert_close(

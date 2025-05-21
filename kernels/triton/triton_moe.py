@@ -34,7 +34,7 @@ class IndexSelectJaggedBmmOption:
     d_jagged_use_wrap_specialization: bool = True
     d_jagged_gemm_out_type: torch.dtype = torch.float32
     d_weight_optimization: bool = True
-    d_weight_split_k_kernel: bool = False
+    d_weight_split_k_kernel: bool = True
     d_weight_split_k_kernel_tma: bool = False
 
 
@@ -582,7 +582,6 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
         option: IndexSelectJaggedBmmOption,
     ) -> torch.Tensor:
         if option.d_jagged_use_grouped_gemm:
-            assert N % 64 == 0, "N must be a multiple of 64"
             m_sizes = (offsets[1:] - offsets[:-1]).to(torch.int32)  # [E]
             weight_grouped = weight.reshape(-1, N)  # [E, K, N] -> [E * K, N]
             d_jagged_expanded = grouped_gemm(
@@ -3284,6 +3283,14 @@ def _silu_jagged_dense_bmm_broadcast_add_bwd_kernel(
     )
 
 
+@dataclasses.dataclass
+class SiluJaggedBmmCombineOption:
+    activation_checkpointing: bool = False
+    d_weight_optimization: bool = True
+    d_weight_split_k_kernel: bool = True
+    d_weight_split_k_kernel_tma: bool = False
+
+
 @torch.fx.wrap
 def triton_silu_jagged_bmm_combine(
     max_seq_len: int,
@@ -3296,8 +3303,8 @@ def triton_silu_jagged_bmm_combine(
     k: int,
     gates: Optional[torch.Tensor] = None,
     gates_index: Optional[torch.Tensor] = None,
-    activation_checkpointing: bool = False,
     has_silu: bool = True,
+    option: Optional[SiluJaggedBmmCombineOption] = None,
 ) -> torch.Tensor:
     return SiluJaggedBmmCombine.apply(
         max_seq_len,
@@ -3309,8 +3316,8 @@ def triton_silu_jagged_bmm_combine(
         k,
         gates,
         gates_index,
-        activation_checkpointing,
         has_silu,
+        option,
     )
 
 
@@ -3325,8 +3332,8 @@ def triton_silu_jagged_bmm_combine_wrapper(
     k: int,
     gates: Optional[torch.Tensor] = None,
     gates_index: Optional[torch.Tensor] = None,
-    activation_checkpointing: bool = False,
     has_silu: bool = True,
+    option: Optional[SiluJaggedBmmCombineOption] = None,
 ) -> torch.Tensor:
     return triton_silu_jagged_bmm_combine(
         max_seq_len=max_seq_len,
@@ -3340,7 +3347,7 @@ def triton_silu_jagged_bmm_combine_wrapper(
         gates=gates,
         gates_index=gates_index,
         has_silu=has_silu,
-        activation_checkpointing=activation_checkpointing,
+        option=option,
     )
 
 
@@ -3356,11 +3363,14 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         index: torch.Tensor,
         k: int,
-        gates: Optional[torch.Tensor] = None,
-        gates_index: Optional[torch.Tensor] = None,
-        activation_checkpointing: Optional[bool] = False,
-        has_silu: bool = True,
+        gates: Optional[torch.Tensor],
+        gates_index: Optional[torch.Tensor],
+        has_silu: bool,
+        option: Optional[SiluJaggedBmmCombineOption],
     ) -> torch.Tensor:
+        if option is None:
+            option = SiluJaggedBmmCombineOption()
+
         jagged = switch_to_contiguous_if_needed(jagged)
         has_bias = bias is not None
         if has_bias:
@@ -3410,7 +3420,7 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
                 stride_om=bmm_out.stride(0),
                 HAS_BIAS=has_bias,
                 ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
-                STORE_SILU=not activation_checkpointing,
+                STORE_SILU=not option.activation_checkpointing,
             )
         else:
             silu_jagged: torch.Tensor = jagged
@@ -3466,7 +3476,7 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
             has_weight,
         )
 
-        if activation_checkpointing:
+        if option.activation_checkpointing:
             ctx.save_for_backward(offsets, jagged, weight, bias, index, g, g_index)
         else:
             ctx.save_for_backward(
@@ -3481,8 +3491,8 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
         ctx.D_out = D_out
         ctx.has_weight = has_weight
         ctx.max_seq_len = max_seq_len
-        ctx.activation_checkpointing = activation_checkpointing
         ctx.has_silu = has_silu
+        ctx.option = option
 
         return output
 
@@ -3503,9 +3513,10 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
         None,
         None,
     ]:
+        option: SiluJaggedBmmCombineOption = ctx.option
         offsets, jagged, weight, bias, index, g, g_index = (
             ctx.saved_tensors
-            if ctx.activation_checkpointing
+            if option.activation_checkpointing
             else ctx.saved_tensors[:-2]
         )
         has_bias = bias is not None
@@ -3514,7 +3525,7 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
         else:
             stride_bias_b = 0
 
-        if ctx.activation_checkpointing:
+        if option.activation_checkpointing:
             # Recomputation
             bmm_out = torch.empty(
                 (ctx.N, ctx.D_out), dtype=jagged.dtype, device=jagged.device
@@ -3651,14 +3662,22 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
                 ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
             )
 
-        optimize = True
-        if optimize:
-            d_weight, d_bias = triton_jagged_bmm_reduce_sum(
-                JaggedA=silu_jagged,
-                JaggedB=d_bmm_out,
-                offsets=offsets,
-                reduce_sum=has_bias,
-            )
+        if option.d_weight_optimization:
+            if option.d_weight_split_k_kernel or option.d_weight_split_k_kernel_tma:
+                d_weight, d_bias = triton_jagged_bmm_reduce_sum_split_k(
+                    JaggedA=silu_jagged,
+                    JaggedB=d_bmm_out,
+                    offsets=offsets,
+                    reduce_sum=has_bias,
+                    use_tma=option.d_weight_split_k_kernel_tma,
+                )
+            else:
+                d_weight, d_bias = triton_jagged_bmm_reduce_sum(
+                    JaggedA=silu_jagged,
+                    JaggedB=d_bmm_out,
+                    offsets=offsets,
+                    reduce_sum=has_bias,
+                )
         else:
             # tensors below needs to be initialized with zeros as there could be unused
             # rows in the weight and bias
@@ -3712,8 +3731,8 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
                 else None
             ),  # gates
             None,  # gates_index
-            None,  # activation_checkpointing
             None,  # has_silu
+            None,  # option
         )
 
 
