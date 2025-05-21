@@ -187,7 +187,7 @@ def triton_sum_dim1(x: torch.Tensor):
     """
     assert x.is_contiguous()
     M, N, K = x.shape
-    assert triton.next_power_of_2(K) == K
+    # assert triton.next_power_of_2(K) == K
     output = torch.empty((M, K), dtype=x.dtype, device=x.device)
 
     def grid(META):

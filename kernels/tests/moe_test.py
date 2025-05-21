@@ -29,7 +29,7 @@ class MOETest(unittest.TestCase):
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
         K=st.sampled_from([2, 4]),
-        D_in=st.sampled_from([32, 64]),
+        D_in=st.sampled_from([12, 32, 64]),
         D_out=st.sampled_from([32, 64, 128]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
@@ -81,7 +81,7 @@ class MOETest(unittest.TestCase):
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
         K=st.sampled_from([2, 4]),
-        D_in=st.sampled_from([32, 64]),
+        D_in=st.sampled_from([12, 32, 64]),
         D_out=st.sampled_from([32, 64, 128]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]

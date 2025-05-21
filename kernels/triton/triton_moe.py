@@ -3748,6 +3748,10 @@ def triton_jagged_bmm_reduce_sum_split_k(
     B = offsets.shape[0] - 1
     M = JaggedA.shape[1]
     N = JaggedB.shape[1]
+
+    if use_tma and M % 128 != 0:
+        use_tma = False
+
     d_weight = torch.zeros((B, M, N), dtype=torch.float32, device=device)
     grid = lambda meta: (  # noqa E731
         meta["SPLIT_K"],
