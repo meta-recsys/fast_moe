@@ -1815,7 +1815,7 @@ def _jagged_reduce_sum(
         )
         for BLOCK_M in [32, 64, 128]
         for BLOCK_N in [32, 64, 128]
-        for SPLIT_K in [1, 2, 4, 8, 16]
+        for SPLIT_K in [16, 8, 4, 2, 1]
         for num_stages in [2, 3]
         for num_warps in [4, 8]
     ],
@@ -1879,7 +1879,8 @@ def _jagged_reduce_sum_split_k(
     for k in range(0, actual_num_k_blocks_per_split):
         jg = tl.load(
             jg_ptrs,
-            mask=(offs_m[:, None] < M) and ((offs_n[None, :] + k * BLOCK_N) < seq_len),
+            mask=(offs_m[:, None] < M)
+            and ((offs_n[None, :] + k_start + k * BLOCK_N) < seq_len),
             other=0.0,
         )
 

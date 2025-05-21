@@ -83,7 +83,7 @@ def get_bmm_split_k_configs() -> List[triton.Config]:
     for BLOCK_M in [64, 128]:
         for BLOCK_N in [64, 128]:
             for BLOCK_K in [32, 64]:
-                for SPLIT_K in [1, 2, 4, 8, 16]:
+                for SPLIT_K in [16, 8, 4, 2, 1]:
                     for num_stages in [2, 3]:
                         for num_warps in [4, 8]:
                             configs.append(
