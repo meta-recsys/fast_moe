@@ -13,6 +13,7 @@ from typing import Tuple
 
 import torch
 from fast_moe.kernels.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
+from fast_moe.utils import set_dev_mode
 from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import quantize_fp8_row
 
 
@@ -24,13 +25,14 @@ class TestGroupedGEMM(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(0)
 
-    @unittest.skipIf(  # pyre-ignore [56]
-        (not torch.cuda.is_available())
-        or (torch.version.hip is None)
-        and (torch.cuda.get_device_properties(0).major < 9),
-        "Skip FP8 test on architectures before SM90.",
-    )
     def test_grouped_gemm_fp8_rowwise(self) -> None:
+        if (torch.version.hip is None) and (
+            torch.cuda.get_device_properties(0).major < 9
+        ):
+            logging.info("Skip FP8 test on architectures before SM90.")
+            return
+        set_dev_mode(True)
+
         def _test_grouped_gemm_fp8_rowwise(
             shape: Tuple[int, int, int, int],
             device: torch.device,
@@ -123,14 +125,15 @@ class TestGroupedGEMM(unittest.TestCase):
                             use_warp_specialization=ws,
                         )
 
-    # TODO(shikaili): Re-enable the test for SM80 after fixing TMA issues.
-    @unittest.skipIf(  # pyre-ignore [56]
-        (not torch.cuda.is_available())
-        or (torch.version.hip is None)
-        and (torch.cuda.get_device_properties(0).major < 9),
-        "Skip BF16 test on architectures before SM90.",
-    )
     def test_grouped_gemm_bf16(self) -> None:
+        if (torch.version.hip is None) and (
+            torch.cuda.get_device_properties(0).major < 8
+        ):
+            logging.info("Skip BF16 test on architectures before SM80.")
+            return
+
+        set_dev_mode(True)
+
         def _test_grouped_gemm_bf16(
             shape: Tuple[int, int, int, int],
             device: torch.device,
