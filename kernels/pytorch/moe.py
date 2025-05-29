@@ -1,8 +1,7 @@
 # pyre-strict
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
-from torch.autograd import Function
 from torch.fx._symbolic_trace import is_fx_tracing
 from torch.nn import functional as F
 
