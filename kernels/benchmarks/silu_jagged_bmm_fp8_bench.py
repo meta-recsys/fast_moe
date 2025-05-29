@@ -148,7 +148,9 @@ def main(
                     bias=bias,
                     kernel=get_kernel(provider),
                 )
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+                print(
+                    prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+                )
 
         if provider in ["triton", "pytorch"]:
             fn = lambda: silu_jagged_bmm_fp8(  # noqa E731
