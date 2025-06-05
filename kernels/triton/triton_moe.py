@@ -1550,9 +1550,20 @@ def cdiv_fn(x, y):
     return (x + y - 1) // y
 
 
+@triton.jit
+def swizzle2d(pid, num_pid_m, num_pid_n, GROUP_M: tl.constexpr):
+    width = GROUP_M * num_pid_n
+    group_id = pid // width
+    first_pid_m = group_id * GROUP_M
+    group_size = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+    return pid_m, pid_n
+
+
 @triton_autotune(
     configs=get_bmm_split_k_configs(),
-    key=["M", "N", "AUTOTUNE_K", "USE_TMA"],
+    key=["M", "N", "AUTOTUNE_K", "USE_TMA", "GROUP_M"],
     restore_value=["Out"],
 )
 @triton.jit
@@ -1576,6 +1587,7 @@ def _jagged_jagged_bmm_split_k(
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
     USE_TMA: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     """
     Computing bmm Out = Jagged x Jagged
@@ -1585,9 +1597,11 @@ def _jagged_jagged_bmm_split_k(
     off_k = tl.program_id(0)
 
     off_mn = tl.program_id(1)
+
     num_n_blocks = cdiv_fn(N, BLOCK_N)
-    off_m = off_mn // num_n_blocks
-    off_n = off_mn % num_n_blocks
+    num_m_blocks = cdiv_fn(M, BLOCK_M)
+
+    off_m, off_n = swizzle2d(off_mn, num_m_blocks, num_n_blocks, GROUP_M)
 
     off_b = tl.program_id(2)
 
@@ -3742,6 +3756,7 @@ def triton_jagged_bmm_reduce_sum_split_k(
     offsets: torch.Tensor,  # (B+1)
     reduce_sum: bool = True,
     use_tma: bool = False,
+    group_m: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # d_weight: (B, M, N), d_bias: (B, N)
     dtype = JaggedA.dtype
     device = JaggedA.device
@@ -3790,6 +3805,7 @@ def triton_jagged_bmm_reduce_sum_split_k(
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         workspace_ptr=workspace_ptr,
         USE_TMA=use_tma,
+        GROUP_M=group_m,
     )
     d_weight = d_weight.to(dtype)
 
