@@ -1794,7 +1794,7 @@ def _jagged_reduce_sum(
         Jagged
         + seq_start.to(tl.int64) * stride_jn
         + offs_m.to(tl.int64)[:, None] * stride_jm
-        + offs_n[None, :].to(tl.int64) * stride_jn,
+        + offs_n[None, :].to(tl.int64) * stride_jn
     )
 
     out_reduce_ptrs = ReduceOut + off_b * M + offs_m
