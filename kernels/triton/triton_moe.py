@@ -1628,8 +1628,13 @@ def _jagged_jagged_bmm_split_k(
             num_k_blocks - off_k * num_k_blocks_per_split, num_k_blocks_per_split
         )
 
-    desc_a, desc_b, desc_c = None, None, None
-    offs_m, offs_n, offs_k, out_ptrs = None, None, None, None
+    desc_a = None
+    desc_b = None
+    desc_c = None
+    offs_m = None
+    offs_n = None
+    offs_k = None
+    out_ptrs = None
 
     if USE_TMA:
         tile_idx = (
@@ -1872,7 +1877,7 @@ def _jagged_reduce_sum_split_k(
         Jagged
         + seq_start.to(tl.int64) * stride_jn
         + offs_m.to(tl.int64)[:, None] * stride_jm
-        + offs_n[None, :].to(tl.int64) * stride_jn,
+        + offs_n[None, :].to(tl.int64) * stride_jn
     )
 
     out_reduce_ptrs = ReduceOut + off_b * M + offs_m
