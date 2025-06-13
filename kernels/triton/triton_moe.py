@@ -1209,7 +1209,7 @@ def _indexed_jagged_jagged_bmm_reduce_sum_3D(
 
         accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
         if off_m == 0:
-            acc_reduce += tl.sum(jg_b, axis=0)
+            acc_reduce += tl.sum(jg_b.to(tl.float32), axis=0)
 
         idx_ptrs += BLOCK_K
         jg_b_ptrs += BLOCK_K * stride_bk
