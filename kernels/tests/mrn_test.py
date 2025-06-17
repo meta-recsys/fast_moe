@@ -1,23 +1,31 @@
 # buck2 test -c fbcode.disable_re_tests=True @//mode/opt //fast_moe/kernels/tests:mrn_test -- --print-passing-details
 import logging
 import unittest
-from dataclasses import dataclass
-from enum import Enum, unique
-from typing import Callable, List, NamedTuple, Optional, Tuple
+
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from fast_moe.kernels.moe import (
-    index_select_jagged_bmm,
-    mul_merge_k_add,
-    silu_jagged_bmm_combine,
-)
+from fast_moe.kernels.moe import index_select_jagged_bmm, silu_jagged_bmm_combine
 
 from fast_moe.kernels.utils import (
     fx_infer_max_len,
     fx_torch_zeros_like,
     gpu_unavailable,
     KernelType,
+)
+
+from fast_moe.utils.configs import SGConfig
+from fast_moe.utils.enums import ExpertType, LossType, RouterChoice
+from fast_moe.utils.types import MRNOutput
+from fast_moe.utils.utils import (
+    _compute_top_logits,
+    _create_fused_mlp_weights,
+    _dispatch,
+    _noisy_logits,
+    _prob_in_top_k,
+    _train_loss,
+    fx_torch_zeros,
 )
 
 from hypothesis import given, settings, strategies as st, Verbosity
@@ -35,60 +43,325 @@ torch.fx.wrap("fx_infer_max_len")
 torch.fx.wrap("fx_torch_zeros_like")
 
 
-@torch.fx.wrap
-def fx_torch_zeros(
-    shape: List[int], device: torch.device, requires_grad: bool
-) -> torch.Tensor:
-    return torch.zeros(shape, device=device, requires_grad=requires_grad)
+class SGMoE(torch.nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        group_norm: bool,
+        num_groups: int,
+        config: SGConfig,
+        custom_kernel: bool = True,
+        is_train: bool = True,
+        test_mode: bool = False,
+    ) -> None:
+        """
+        Args:
+            test_mode: Currently for turning on stable sorting which is slow otherwise
+        """
+        super().__init__()
+        self._is_inference: bool = not is_train
+        self._stable_sorting = True if test_mode else False
 
+        self._custom_kernel = custom_kernel
 
-class MRNOutput(NamedTuple):
-    x: torch.Tensor
-    loss: Optional[torch.Tensor]
-    load: Optional[torch.Tensor]
+        self.num_experts: int = config.num_experts
+        # TODO: use actual shared expert
+        self.s: int = 1
+        self.k: int = config.num_activated_experts
 
+        self.loss_coef: float = 1e-2
+        self.model_d: int = config.model_d
+        self.output_hidden_dim: int = self.model_d * self.s
+        self.output_size: int = output_size
+        self.input_size: int = input_size
+        self.custom_kernel: bool = custom_kernel
+        self.is_train: bool = is_train
+        self.use_input_dtype: bool = config.use_input_dtype
+        self.activation_checkpointing: bool = False
+        self.norm_eps: float = 1e-6
+        # TODO: support expert_type
+        self._expert_type: ExpertType = ExpertType.MLP
+        # TODO: support router_choice
+        self.router_choice: RouterChoice = RouterChoice.Vanilla
 
-@unique
-class ExpertType(Enum):
-    MLP = "MLP"
-    FFN = "FFN"
-    FFNBIAS = "FFN_WITH_BIAS"
+        post_norm = False
+        self._post_norm: bool = post_norm
+        self._loss_type: LossType = LossType.LB
+        assert (
+            self.k <= self.num_experts
+        ), f"Expect k <= num_experts, but got {self.k} > {self.num_experts}"
+        assert self.num_experts > 0 or self.s > 0
 
+        self._norm_w: torch.nn.Parameter = torch.nn.Parameter(
+            torch.ones((self.input_size,)),
+        )
+        self._norm_bias: torch.nn.Parameter = torch.nn.Parameter(
+            torch.zeros((self.input_size,)),
+        )
 
-@unique
-class RouterChoice(Enum):
-    TopK = "TOP_K"
-    Vanilla = "VANILLA"
+        if self._post_norm:
+            self._output_norm_w: torch.nn.Parameter = torch.nn.Parameter(
+                torch.ones((self.output_size,)),
+            )
+            self._output_norm_bias: torch.nn.Parameter = torch.nn.Parameter(
+                torch.zeros((self.output_size,)),
+            )
 
+        self._dispatch: Callable[
+            [torch.Tensor, torch.Tensor, bool],
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = torch.compile(_dispatch) if self.is_train else _dispatch
 
-@unique
-class LossType(Enum):
-    LB = "LOAD_BALANCE"
-    MI = "MUTAL_INFORMATION"
+        self.enable_noisy_gating: bool = config.enable_noisy_gating
 
+        self.group_norm: bool = group_norm
+        logger.info(
+            f"SGMoE ({self.k}/{self.num_experts}), dims={self.input_size}-{self.model_d}-{self.output_size}"
+        )
 
-@dataclass
-class SGConfig:
-    model_d: int
-    num_experts: int
-    num_activated_experts: int
-    loss_coef: float = 1e-2
-    # control whether an MRN layer will use the input activation dtype from
-    # HSTU as its dtype or not. I.e., if HSTU uses BF16 computation, MRN will
-    # follow that throughout forward and backward if this is set to True.
-    # Otherwise, MRN will let autocast automatically decide the proper dtypes.
-    use_input_dtype: bool = True
-    # control whether we apply activation checkpointing to mrn_compute_output and
-    # silu_jagged_bmm_combine.
-    activation_checkpointing: bool = False
-    enable_noisy_gating: bool = False
+        self._experts_hidden_w = torch.nn.Parameter(
+            data=_create_fused_mlp_weights(
+                self.num_experts,
+                self.model_d,
+                input_size,
+            )
+        )
+        self._experts_hidden_bias = torch.nn.Parameter(
+            data=torch.empty(
+                [self.num_experts, self.model_d],
+            ).fill_(0.0)
+        )
 
+        self._experts_w = torch.nn.Parameter(
+            data=_create_fused_mlp_weights(
+                self.num_experts,
+                output_size,
+                self.model_d,
+            )
+        )
+        self._experts_bias = torch.nn.Parameter(
+            data=torch.empty(
+                [self.num_experts, output_size],
+            ).fill_(0.0)
+        )
 
-def _create_fused_mlp_weights(num_mlps: int, in_dim: int, out_dim: int) -> torch.Tensor:
-    t = torch.empty(size=(num_mlps, in_dim, out_dim))
-    for i in range(num_mlps):
-        torch.nn.init.xavier_uniform_(t[i])
-    return t
+        self._w_gate: torch.nn.Parameter = torch.nn.Parameter(
+            (
+                torch.zeros(
+                    input_size,
+                    self.num_experts,
+                )
+                if self.enable_noisy_gating
+                else torch.empty(
+                    input_size,
+                    self.num_experts,
+                )
+            ),
+            requires_grad=True,
+        )
+
+        if self.enable_noisy_gating:
+            self._w_noise: torch.nn.Parameter = torch.nn.Parameter(
+                torch.zeros(
+                    input_size,
+                    self.num_experts,
+                ),
+                requires_grad=True,
+            )
+        else:
+            torch.nn.init.xavier_uniform_(self._w_gate)
+
+        self.register_buffer("mean", torch.tensor([0.0]))
+        self.register_buffer("std", torch.tensor([1.0]))
+
+        self._output_weight = torch.nn.Parameter(
+            torch.empty(
+                (
+                    input_size,
+                    output_size,
+                )
+            ),
+        )
+        torch.nn.init.xavier_uniform_(self._output_weight)
+        self._k_plus: int = min(self.k + 1, self.num_experts)
+
+        assert self.k <= self.num_experts
+
+        self._prob_in_top_k: Callable[
+            [
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                int,
+            ],
+            torch.Tensor,
+        ] = torch.compile(_prob_in_top_k) if is_train else _prob_in_top_k
+
+        self._compute_top_logits: Callable[
+            [torch.Tensor, int, int, torch.dtype, bool, bool],
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = torch.compile(_compute_top_logits) if is_train else _compute_top_logits
+
+        self._train_loss: Callable[
+            [torch.Tensor, torch.Tensor, float],
+            torch.Tensor,
+        ] = torch.compile(_train_loss) if is_train else _train_loss
+
+        self._noisy_logits: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = torch.compile(_noisy_logits) if is_train else _noisy_logits
+
+    def _kernel_type(self) -> KernelType:
+        if self._custom_kernel:
+            return KernelType.TRITON
+        else:
+            return KernelType.PYTORCH
+
+    def _noisy_gating(
+        self,
+        x: torch.Tensor,
+        train: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        clean_logits = x @ self._w_gate
+        if train and self.enable_noisy_gating:
+            noisy_logits, noise_stddev, noise_stddev = self._noisy_logits(
+                x,
+                clean_logits,
+                self._w_noise,
+                torch.randn_like(clean_logits),
+            )
+            logits = noisy_logits
+        else:
+            logits = clean_logits
+
+        top_logits, top_k_gates, top_k_indices = self._compute_top_logits(
+            logits,
+            self.k,
+            self._k_plus,
+            x.dtype if self.use_input_dtype else logits.dtype,
+            False,
+            self._stable_sorting,
+        )
+
+        zeros = fx_torch_zeros_like(logits, dtype=top_k_gates.dtype)
+        gates = zeros.scatter(1, top_k_indices, top_k_gates)
+        if self.k < self.num_experts and train and self.enable_noisy_gating:
+            load = self._prob_in_top_k(
+                clean_logits,
+                noisy_logits,  # pyre-ignore
+                noise_stddev,  # pyre-ignore
+                top_logits,
+                self.mean,
+                self.std,
+                self.k,
+            )
+        else:
+            load = gates > 0
+
+        if not train:
+            loss = fx_torch_zeros([], device=top_k_gates.device, requires_grad=False)
+            return load, top_k_gates, top_k_indices, loss
+        else:
+            return (
+                load,
+                top_k_gates,
+                top_k_indices,
+                self._train_loss(gates, load, self.loss_coef),
+            )
+
+    def _gating(
+        self,
+        x: torch.Tensor,
+        train: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._noisy_gating(x, train)
+
+    def _expert_forward(
+        self,
+        x: torch.Tensor,
+        token_index: torch.Tensor,
+        lengths: torch.Tensor,
+        gate_index: torch.Tensor,
+        gates: torch.Tensor,
+    ) -> torch.Tensor:
+        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+        reverse_token_index: torch.Tensor = token_index.sort(
+            stable=self._stable_sorting
+        )[1].view_as(gates)
+        max_seq_len = fx_infer_max_len(lengths)
+        with record_function("## expert_forward##"):
+            expert_hidden = index_select_jagged_bmm(
+                max_seq_len=max_seq_len,
+                offsets=offsets,
+                index=gate_index.view(-1, self.k),
+                jagged=x,
+                weight=self._experts_hidden_w.permute(0, 2, 1).to(x.dtype),
+                bias=self._experts_hidden_bias.to(x.dtype),
+                kernel=self._kernel_type(),
+            )
+
+            y = silu_jagged_bmm_combine(
+                max_seq_len=max_seq_len,
+                offsets=offsets,
+                jagged=expert_hidden,
+                weight=self._experts_w.permute(0, 2, 1).to(x.dtype),
+                bias=self._experts_bias.to(x.dtype),
+                index=token_index,
+                reverse_index=reverse_token_index,
+                gates=gates,
+                gates_index=gate_index,
+                kernel=self._kernel_type(),
+            )
+        return y
+
+    def _shared_expert_forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return torch.addmm(y, x, self._output_weight)
+
+    def router_forward(
+        self, x: torch.Tensor, train: bool, shared_x: Optional[torch.Tensor] = None
+    ) -> MRNOutput:
+        if self.num_experts > 0:
+            load, top_k_gates, top_k_indices, loss = self._gating(x, train=train)
+            with record_function("## dispatch ##"):
+                token_index, lengths, gate_index = self._dispatch(
+                    load,
+                    top_k_indices,
+                    self._stable_sorting,
+                )
+                load = lengths / lengths.sum()
+            y = self._expert_forward(x, token_index, lengths, gate_index, top_k_gates)
+        else:
+            y = x
+            loss, load = None, None
+
+        y = self._shared_expert_forward(shared_x if shared_x is not None else x, y)
+
+        return MRNOutput(y, loss, load)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_offsets: torch.Tensor,
+        max_seq_len: int,
+    ) -> MRNOutput:
+        x_norm = F.layer_norm(
+            x,
+            normalized_shape=(x.shape[-1],),
+            weight=self._norm_w.to(x.dtype),
+            bias=self._norm_bias.to(x.dtype),
+            eps=self.norm_eps,
+        )
+
+        # norm is on the disallowed list for AMP autocast, where the output
+        # will be FP32 even if BF16 autocast is enabled. So, explicitly cast
+        # back to input dtype here.
+        x_norm = x_norm.to(x.dtype) if self.use_input_dtype else x_norm
+        return self.router_forward(x_norm, self.training, x)
 
 
 class OrigDispatcherImpl(object):
@@ -283,7 +556,7 @@ class OrigSGMoEImpl(torch.nn.Module):
         sorted_logits, sorted_indices = logits.sort(
             descending=True,
             dim=1,
-            stable=True,  # stable=mrn.STABLE_SORTING
+            stable=STABLE_SORTING,
         )
         top_logits = sorted_logits[:, : self._k_plus]
         top_k_indices = sorted_indices[:, : self.k]
@@ -379,450 +652,6 @@ class OrigSGMoEImpl(torch.nn.Module):
         return MRNOutput(y, output[1], output[2])
 
 
-def _dispatch(
-    load: torch.Tensor,
-    top_k_indices: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # L: top_k_indices.shape[0]
-    # K: top_k_indices.shape[1]
-    # The dispatched result Y is a [L*K, D] tensor where L is the number of tokens in
-    # the batch, K is the number of active experts, and D is the input dimension.
-    #
-    # expert_index [L*K]: for each row in Y, which expert it should be routed to
-    # gate_index [L*K]: for each row in Y, which value in top_k_gates.view(-1) it corresponds to
-    _, gate_index = top_k_indices.view(-1).sort(stable=STABLE_SORTING)
-    # shape [L*K]: for each row in Y, which token it is from
-    token_index: torch.Tensor = gate_index // top_k_indices.size(1)
-    # shape [E]
-    num_tokens_per_expert: torch.Tensor = load.sum(0)
-
-    return token_index, num_tokens_per_expert, gate_index
-
-
-def _combine(
-    expert_out: torch.Tensor,
-    o2i_token_index: torch.Tensor,
-    i2o_token_index: torch.Tensor,
-    top_k_gates: torch.Tensor,
-    gate_index: torch.Tensor,
-    multiply_by_gates: bool = True,
-    kernel: KernelType = KernelType.PYTORCH,
-) -> torch.Tensor:
-    with record_function("## combine ##"):
-        return mul_merge_k_add(
-            index=o2i_token_index,
-            reverse_index=i2o_token_index,
-            value=expert_out,
-            stable_sorting=STABLE_SORTING,
-            weight=top_k_gates if multiply_by_gates else None,
-            weight_index=gate_index if multiply_by_gates else None,
-            kernel=kernel,
-        )
-
-
-def _prob_in_top_k(
-    clean_values: torch.Tensor,
-    noisy_values: torch.Tensor,
-    noise_stddev: torch.Tensor,
-    noisy_top_values: torch.Tensor,
-    mean: torch.Tensor,
-    std: torch.Tensor,
-    k: int,
-) -> torch.Tensor:
-    batch = clean_values.size(0)
-    m = noisy_top_values.size(1)
-    top_values_flat = noisy_top_values.flatten()
-
-    threshold_positions_if_in = torch.arange(batch, device=clean_values.device) * m + k
-    threshold_if_in = torch.unsqueeze(
-        torch.gather(top_values_flat, 0, threshold_positions_if_in), 1
-    )
-
-    is_in = torch.gt(noisy_values, threshold_if_in)
-    threshold_positions_if_out = threshold_positions_if_in - 1
-    threshold_if_out = torch.unsqueeze(
-        torch.gather(top_values_flat, 0, threshold_positions_if_out), 1
-    )
-
-    # Normal (super class Distribution) ctor forces D2H sync at
-    # for every argument constrant https://fburl.com/gpfcsmc5  and input value
-    # support https://fburl.com/9mnold55. The check enforces self.mean is a real
-    # number and self.std is positive. The value support enforces the input is a
-    # real number. We know these are always true for this model, so we skip those
-    # checks to avoid blocking D2H syncs.
-    normal = Normal(mean, std, validate_args=False)
-    prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
-    prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)
-    prob = torch.where(is_in, prob_if_in, prob_if_out)
-    return prob
-
-
-def _compute_top_logits(
-    logits: torch.Tensor,
-    k: int,
-    k_plus: int,
-    dtype: torch.dtype,
-    post_softmax: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    logits = F.normalize(logits, dim=1)
-    sorted_logits, sorted_indices = logits.sort(
-        descending=True, dim=1, stable=STABLE_SORTING
-    )
-    top_logits = sorted_logits[:, :k_plus]
-    top_k_indices = sorted_indices[:, :k].contiguous()
-    if post_softmax and k > 1:
-        top_k_logits = sorted_logits[:, :k]
-        top_k_gates = F.softmax(top_k_logits, dim=1)
-    else:
-        top_gates = F.softmax(sorted_logits, dim=1)
-        top_k_gates = top_gates[:, :k]
-
-    # softplus and softmax forces FP32 outputs even under BF16 autocast context.
-    # Converting back to input dtype so that subsequent computations will run in
-    # desired precision.
-    top_k_gates = top_k_gates.to(dtype).contiguous()
-    return top_logits, top_k_gates, top_k_indices
-
-
-def _cv_squared(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    if x.shape[0] == 1:
-        return torch.tensor([0], device=x.device, dtype=x.dtype)
-
-    x_float = x.float()
-    return x_float.var() / (x_float.mean().pow(2) + eps)
-
-
-def _train_loss(
-    gates: torch.Tensor, load: torch.Tensor, loss_coef: float
-) -> torch.Tensor:
-    return (_cv_squared(gates.sum(0)) + _cv_squared(load.sum(0))) * loss_coef
-
-
-def _noisy_logits(
-    x: torch.Tensor,
-    clean_logits: torch.Tensor,
-    weight_noise: torch.Tensor,
-    noise: torch.Tensor,
-    noise_eps: float = 1e-2,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    raw_noise_stddev = x @ weight_noise
-    noise_stddev = F.softplus(raw_noise_stddev) + noise_eps
-    noisy_logits = clean_logits + (noise * noise_stddev)
-    return noisy_logits, noise_stddev, noise_stddev
-
-
-class SGMoE(torch.nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        group_norm: bool,
-        num_groups: int,
-        config: SGConfig,
-        custom_kernel: bool = True,
-        is_train: bool = True,
-    ) -> None:
-        super().__init__()
-        self._is_inference: bool = not is_train
-
-        self._custom_kernel = custom_kernel
-
-        self.num_experts: int = config.num_experts
-        # TODO: use actual shared expert
-        self.s: int = 1
-        self.k: int = config.num_activated_experts
-
-        self.loss_coef: float = 1e-2
-        self.model_d: int = config.model_d
-        self.output_hidden_dim: int = self.model_d * self.s
-        self.output_size: int = output_size
-        self.input_size: int = input_size
-        self.custom_kernel: bool = custom_kernel
-        self.is_train: bool = is_train
-        self.use_input_dtype: bool = config.use_input_dtype
-        self.activation_checkpointing: bool = False
-        self.norm_eps: float = 1e-6
-        # TODO: support expert_type
-        self._expert_type: ExpertType = ExpertType.MLP
-        # TODO: support router_choice
-        self.router_choice: RouterChoice = RouterChoice.Vanilla
-
-        post_norm = False
-        self._post_norm: bool = post_norm
-        self._loss_type: LossType = LossType.LB
-        assert (
-            self.k <= self.num_experts
-        ), f"Expect k <= num_experts, but got {self.k} > {self.num_experts}"
-        assert self.num_experts > 0 or self.s > 0
-
-        self._norm_w: torch.nn.Parameter = torch.nn.Parameter(
-            torch.ones((self.input_size,)),
-        )
-        self._norm_bias: torch.nn.Parameter = torch.nn.Parameter(
-            torch.zeros((self.input_size,)),
-        )
-
-        if self._post_norm:
-            self._output_norm_w: torch.nn.Parameter = torch.nn.Parameter(
-                torch.ones((self.output_size,)),
-            )
-            self._output_norm_bias: torch.nn.Parameter = torch.nn.Parameter(
-                torch.zeros((self.output_size,)),
-            )
-
-        self._dispatch: Callable[
-            [torch.Tensor, torch.Tensor],
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        ] = torch.compile(_dispatch) if self.is_train else _dispatch
-
-        self.enable_noisy_gating: bool = config.enable_noisy_gating
-
-        self.group_norm: bool = group_norm
-        logger.info(
-            f"SGMoE ({self.k}/{self.num_experts}), dims={self.input_size}-{self.model_d}-{self.output_size}"
-        )
-
-        self._experts_hidden_w = torch.nn.Parameter(
-            data=_create_fused_mlp_weights(
-                self.num_experts,
-                self.model_d,
-                input_size,
-            )
-        )
-        self._experts_hidden_bias = torch.nn.Parameter(
-            data=torch.empty(
-                [self.num_experts, self.model_d],
-            ).fill_(0.0)
-        )
-
-        self._experts_w = torch.nn.Parameter(
-            data=_create_fused_mlp_weights(
-                self.num_experts,
-                output_size,
-                self.model_d,
-            )
-        )
-        self._experts_bias = torch.nn.Parameter(
-            data=torch.empty(
-                [self.num_experts, output_size],
-            ).fill_(0.0)
-        )
-
-        self._w_gate: torch.nn.Parameter = torch.nn.Parameter(
-            (
-                torch.zeros(
-                    input_size,
-                    self.num_experts,
-                )
-                if self.enable_noisy_gating
-                else torch.empty(
-                    input_size,
-                    self.num_experts,
-                )
-            ),
-            requires_grad=True,
-        )
-
-        if self.enable_noisy_gating:
-            self._w_noise: torch.nn.Parameter = torch.nn.Parameter(
-                torch.zeros(
-                    input_size,
-                    self.num_experts,
-                ),
-                requires_grad=True,
-            )
-        else:
-            torch.nn.init.xavier_uniform_(self._w_gate)
-
-        self.register_buffer("mean", torch.tensor([0.0]))
-        self.register_buffer("std", torch.tensor([1.0]))
-
-        self._output_weight = torch.nn.Parameter(
-            torch.empty(
-                (
-                    input_size,
-                    output_size,
-                )
-            ),
-        )
-        torch.nn.init.xavier_uniform_(self._output_weight)
-        self._k_plus: int = min(self.k + 1, self.num_experts)
-
-        assert self.k <= self.num_experts
-
-        self._prob_in_top_k: Callable[
-            [
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                int,
-            ],
-            torch.Tensor,
-        ] = torch.compile(_prob_in_top_k) if is_train else _prob_in_top_k
-
-        self._compute_top_logits: Callable[
-            [torch.Tensor, int, int, torch.dtype],
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        ] = torch.compile(_compute_top_logits) if is_train else _compute_top_logits
-
-        self._train_loss: Callable[
-            [torch.Tensor, torch.Tensor, float],
-            torch.Tensor,
-        ] = torch.compile(_train_loss) if is_train else _train_loss
-
-        self._noisy_logits: Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        ] = torch.compile(_noisy_logits) if is_train else _noisy_logits
-
-    def _kernel_type(self) -> KernelType:
-        if self._custom_kernel:
-            return KernelType.TRITON
-        else:
-            return KernelType.PYTORCH
-
-    def _noisy_gating(
-        self,
-        x: torch.Tensor,
-        train: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        clean_logits = x @ self._w_gate
-        if train and self.enable_noisy_gating:
-            noisy_logits, noise_stddev, noise_stddev = self._noisy_logits(
-                x,
-                clean_logits,
-                self._w_noise,
-                torch.randn_like(clean_logits),
-            )
-            logits = noisy_logits
-        else:
-            logits = clean_logits
-
-        top_logits, top_k_gates, top_k_indices = self._compute_top_logits(
-            logits,
-            self.k,
-            self._k_plus,
-            x.dtype if self.use_input_dtype else logits.dtype,
-        )
-
-        zeros = fx_torch_zeros_like(logits, dtype=top_k_gates.dtype)
-        gates = zeros.scatter(1, top_k_indices, top_k_gates)
-        if self.k < self.num_experts and train and self.enable_noisy_gating:
-            load = self._prob_in_top_k(
-                clean_logits,
-                noisy_logits,  # pyre-ignore
-                noise_stddev,  # pyre-ignore
-                top_logits,
-                self.mean,
-                self.std,
-                self.k,
-            )
-        else:
-            load = gates > 0
-
-        if not train:
-            loss = fx_torch_zeros([], device=top_k_gates.device, requires_grad=False)
-            return load, top_k_gates, top_k_indices, loss
-        else:
-            return (
-                load,
-                top_k_gates,
-                top_k_indices,
-                self._train_loss(gates, load, self.loss_coef),
-            )
-
-    def _gating(
-        self,
-        x: torch.Tensor,
-        train: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self._noisy_gating(x, train)
-
-    def _expert_forward(
-        self,
-        x: torch.Tensor,
-        token_index: torch.Tensor,
-        lengths: torch.Tensor,
-        gate_index: torch.Tensor,
-        gates: torch.Tensor,
-    ) -> torch.Tensor:
-        offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-        reverse_token_index: torch.Tensor = token_index.sort(stable=STABLE_SORTING)[
-            1
-        ].view_as(gates)
-        max_seq_len = fx_infer_max_len(lengths)
-        with record_function("## expert_forward##"):
-            expert_hidden = index_select_jagged_bmm(
-                max_seq_len=max_seq_len,
-                offsets=offsets,
-                index=gate_index.view(-1, self.k),
-                jagged=x,
-                weight=self._experts_hidden_w.permute(0, 2, 1).to(x.dtype),
-                bias=self._experts_hidden_bias.to(x.dtype),
-                kernel=self._kernel_type(),
-            )
-
-            y = silu_jagged_bmm_combine(
-                max_seq_len=max_seq_len,
-                offsets=offsets,
-                jagged=expert_hidden,
-                weight=self._experts_w.permute(0, 2, 1).to(x.dtype),
-                bias=self._experts_bias.to(x.dtype),
-                index=token_index,
-                reverse_index=reverse_token_index,
-                gates=gates,
-                gates_index=gate_index,
-                kernel=self._kernel_type(),
-            )
-        return y
-
-    def _shared_expert_forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return torch.addmm(y, x, self._output_weight)
-
-    def router_forward(
-        self, x: torch.Tensor, train: bool, shared_x: Optional[torch.Tensor] = None
-    ) -> MRNOutput:
-        if self.num_experts > 0:
-            load, top_k_gates, top_k_indices, loss = self._gating(x, train=train)
-            with record_function("## dispatch ##"):
-                token_index, lengths, gate_index = self._dispatch(
-                    load,
-                    top_k_indices,
-                )
-                load = lengths / lengths.sum()
-            y = self._expert_forward(x, token_index, lengths, gate_index, top_k_gates)
-        else:
-            y = x
-            loss, load = None, None
-
-        y = self._shared_expert_forward(shared_x if shared_x is not None else x, y)
-
-        return MRNOutput(y, loss, load)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        x_offsets: torch.Tensor,
-        max_seq_len: int,
-    ) -> MRNOutput:
-        x_norm = F.layer_norm(
-            x,
-            normalized_shape=(x.shape[-1],),
-            weight=self._norm_w.to(x.dtype),
-            bias=self._norm_bias.to(x.dtype),
-            eps=self.norm_eps,
-        )
-
-        # norm is on the disallowed list for AMP autocast, where the output
-        # will be FP32 even if BF16 autocast is enabled. So, explicitly cast
-        # back to input dtype here.
-        x_norm = x_norm.to(x.dtype) if self.use_input_dtype else x_norm
-        return self.router_forward(x_norm, self.training, x)
-
-
 class MrnTest(unittest.TestCase):
     @given(
         B=st.sampled_from([16, 32]),
@@ -911,6 +740,7 @@ class MrnTest(unittest.TestCase):
             ),
             custom_kernel=custom_kernel,
             is_train=True,
+            test_mode=True,
         ).to(device)
 
         lengths = torch.randint(low=1, high=max_seq_len + 1, size=(B,), device=device)

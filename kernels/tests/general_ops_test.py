@@ -5,8 +5,8 @@
 import unittest
 
 import torch
+from fast_moe.dev_settings import set_dev_mode
 from fast_moe.kernels.utils import gpu_unavailable
-from fast_moe.utils import set_dev_mode
 from hypothesis import given, settings, strategies as st, Verbosity
 from torch.functional import F
 

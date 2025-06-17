@@ -6,6 +6,7 @@ import unittest
 from typing import Optional
 
 import torch
+from fast_moe.dev_settings import set_dev_mode
 from fast_moe.kernels.triton.triton_moe import (
     IndexSelectJaggedBmmOption,
     SiluJaggedBmmCombineOption,
@@ -15,7 +16,6 @@ from fast_moe.kernels.utils import (
     KernelType,
     to_fp32_if_pytorch_kernel,
 )
-from fast_moe.utils import set_dev_mode
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

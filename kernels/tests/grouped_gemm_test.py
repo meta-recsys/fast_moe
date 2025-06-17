@@ -12,8 +12,8 @@ import unittest
 from typing import Tuple
 
 import torch
+from fast_moe.dev_settings import set_dev_mode
 from fast_moe.kernels.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
-from fast_moe.utils import set_dev_mode
 from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import quantize_fp8_row
 
 

@@ -9,7 +9,7 @@ import torch
 # @manual=//triton:triton
 import triton
 
-from fast_moe.utils import get_verbose_level, is_dev_mode
+from fast_moe.dev_settings import get_verbose_level, is_dev_mode
 
 # @manual=//triton:triton
 from triton.runtime.autotuner import Autotuner, Heuristics

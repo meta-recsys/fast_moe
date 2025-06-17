@@ -7,13 +7,13 @@ import unittest
 from typing import Optional
 
 import torch
+from fast_moe.dev_settings import set_dev_mode
 
 from fast_moe.kernels.utils import (
     gpu_unavailable,
     KernelType,
     to_fp32_if_pytorch_kernel,
 )
-from fast_moe.utils import set_dev_mode
 from hypothesis import given, seed, settings, strategies as st, Verbosity
 
 # buck2 test -c fbcode.disable_re_tests=True @//mode/opt fast_moe/kernels/tests:moe_fp8_test -- --print-passing-details
