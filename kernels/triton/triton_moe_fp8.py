@@ -14,7 +14,17 @@ import triton.language as tl
 
 from fast_moe.kernels.triton.triton_gemm_fp8 import grouped_gemm_fp8_rowwise_bias
 
-from fast_moe.kernels.triton.triton_moe import _jagged_jagged_bmm, _jagged_reduce_sum
+from fast_moe.kernels.triton.triton_moe import (
+    _jagged_jagged_bmm,
+    _jagged_jagged_bmm_reduce_sum,
+    _jagged_reduce_sum,
+    _mul_merge_k_add_bwd,
+    _mul_merge_k_add_fwd,
+    _silu_jagged_dense_bmm_broadcast_add_bwd_kernel,
+    _silu_jagged_dense_bmm_broadcast_add_fwd_kernel,
+    jagged_dense_bmm_broadcast_add_kernel,
+    triton_jagged_bmm_reduce_sum,
+)
 
 from fast_moe.kernels.triton.triton_quant_fp8 import (
     _rowwise_quant_fp8_kernel,
@@ -30,7 +40,6 @@ from fast_moe.kernels.triton.utils import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-
 from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import quantize_fp8_row
 
 
@@ -350,7 +359,7 @@ def triton_silu_jagged_bmm_fp8(
     if not use_grouped_gemm:
         return SiluJaggedBmmFp8.apply(seq_offsets, max_seq_len, jagged, weight, bias)
     else:
-        return SiluJaggedBmmFp8GroupedGemm.apply(
+        return SiluJaggedBmmFp8MixedGemmCombine.apply(
             seq_offsets, max_seq_len, jagged, weight, bias
         )
 
@@ -1337,4 +1346,407 @@ class IndexSelectJaggedBmm(torch.autograd.Function):
             d_jagged_expanded.sum(dim=1).to(jagged.dtype),  # sum over A dimension
             d_weight,
             d_bias,
+        )
+
+
+def triton_silu_jagged_bmm_combine_fp8(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    index: torch.Tensor,
+    reverse_index: torch.Tensor,
+    k: int,
+    gates: Optional[torch.Tensor] = None,
+    gates_index: Optional[torch.Tensor] = None,
+    activation_checkpointing: bool = False,
+    has_silu: bool = True,
+) -> torch.Tensor:
+    return SiluJaggedBmmFp8MixedGemmCombine.apply(
+        max_seq_len,
+        offsets,
+        jagged,
+        weight,
+        bias,
+        reverse_index,
+        k,
+        gates,
+        gates_index,
+        activation_checkpointing,
+        has_silu,
+    )
+
+
+# SiluJaggedBmmCombine operator in hybrid precision:
+# fwd: rowwise fp8
+# bwd: bf16
+class SiluJaggedBmmFp8MixedGemmCombine(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        max_seq_len: int,
+        offsets: torch.Tensor,
+        jagged: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        index: torch.Tensor,
+        k: int,
+        gates: Optional[torch.Tensor] = None,
+        gates_index: Optional[torch.Tensor] = None,
+        activation_checkpointing: Optional[bool] = False,
+        has_silu: bool = True,
+    ) -> torch.Tensor:
+        E, D_out, D_in = weight.shape
+        L = jagged.shape[0]
+
+        xq = torch.empty_like(jagged, dtype=torch.float8_e4m3fn, device=jagged.device)
+        x_scale = torch.empty(L, dtype=torch.float32, device=jagged.device)
+        _jagged_silu = torch.empty_like(jagged, dtype=jagged.dtype)
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(L, meta["BLOCK_M"]),
+        )
+
+        _rowwise_quant_fp8_kernel[grid](
+            jagged,
+            x_scale,
+            xq,
+            D_IN=L,
+            K=D_in,
+            stride_km=D_in,
+            silu_out=_jagged_silu,
+            APPLY_SILU=True,
+        )
+
+        wq = torch.empty(
+            (E * D_out, D_in), dtype=torch.float8_e4m3fn, device=weight.device
+        )
+        w_scale = torch.empty((E * D_out), dtype=torch.float32, device=weight.device)
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(E * D_out, meta["BLOCK_M"]),
+        )
+
+        _rowwise_quant_fp8_kernel[grid](
+            weight,
+            w_scale,
+            wq,
+            D_IN=E * D_out,
+            K=D_in,
+            stride_km=D_in,
+            silu_out=None,
+            APPLY_SILU=False,
+        )
+
+        m_sizes = offsets[1:] - offsets[:-1]
+        m_sizes = m_sizes.to(torch.int32)
+
+        jagged_out = grouped_gemm_fp8_rowwise_bias(
+            xq,
+            wq,
+            m_sizes,
+            x_scale,
+            w_scale,
+            bias=bias,
+            _use_warp_specialization=False,
+        )
+
+        if gates is not None:
+            assert gates_index is not None
+            assert L == gates.numel() == gates_index.numel()
+            g = switch_to_contiguous_if_needed(gates)
+            g_index = switch_to_contiguous_if_needed(gates_index)
+            g_stride = g.stride(0)
+        else:
+            g = torch.empty((), dtype=jagged.dtype, device=jagged.device)
+            g_index = torch.empty((), dtype=index.dtype, device=index.device)
+            g_stride = 0
+
+        has_weight = gates is not None
+
+        N = L // k
+        output = torch.empty((N, D_out), dtype=jagged.dtype, device=jagged.device)
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(D_out, meta["BLOCK_D"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+
+        _mul_merge_k_add_fwd[grid](
+            index,
+            jagged_out,
+            g,
+            g_index,
+            output,
+            N,
+            D_out,
+            g_stride,
+            k,
+            has_weight,
+        )
+
+        if activation_checkpointing:
+            ctx.save_for_backward(offsets, jagged, weight, bias, index, g, g_index)
+        else:
+            ctx.save_for_backward(
+                offsets,
+                jagged,
+                weight,
+                bias,
+                index,
+                g,
+                g_index,
+                _jagged_silu,
+                jagged_out,
+            )
+
+        ctx.L = N
+        ctx.N = L
+        ctx.k = k
+        ctx.E = E
+        ctx.D_in = D_in
+        ctx.D_out = D_out
+        ctx.has_weight = has_weight
+        ctx.max_seq_len = max_seq_len
+        ctx.activation_checkpointing = activation_checkpointing
+        ctx.has_silu = has_silu
+
+        ctx.activation_checkpointing = activation_checkpointing
+        ctx.has_silu = has_silu
+
+        return output
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx, d_output: torch.Tensor
+    ) -> Tuple[
+        None,
+        None,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        None,
+        None,
+        Optional[torch.Tensor],
+        None,
+        None,
+        None,
+    ]:
+        offsets, jagged, weight, bias, index, g, g_index = (
+            ctx.saved_tensors
+            if ctx.activation_checkpointing
+            else ctx.saved_tensors[:-2]
+        )
+
+        weight = weight.permute(0, 2, 1)
+        weight = switch_to_contiguous_if_needed(weight)
+
+        has_bias = bias is not None
+        if has_bias:
+            stride_bias_b = bias.stride(0)
+        else:
+            stride_bias_b = 0
+
+        if ctx.activation_checkpointing:
+            # Recomputation
+            bmm_out = torch.empty(
+                (ctx.N, ctx.D_out), dtype=jagged.dtype, device=jagged.device
+            )
+
+            grid = lambda meta: (  # noqa E731
+                triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
+                triton.cdiv(ctx.max_seq_len, meta["BLOCK_M"]),
+                ctx.E,
+            )
+
+            if ctx.has_silu:
+                silu_jagged: torch.Tensor = torch.empty_like(jagged)
+                _silu_jagged_dense_bmm_broadcast_add_fwd_kernel[grid](
+                    seq_offsets=offsets,
+                    Jagged=jagged,
+                    Silu_Jagged=silu_jagged,
+                    Dense=weight,
+                    Bias=bias,
+                    Out=bmm_out,
+                    AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+                    N=ctx.D_out,
+                    K=ctx.D_in,
+                    stride_jm=jagged.stride(0),
+                    stride_sjm=silu_jagged.stride(0),
+                    stride_db=weight.stride(0),
+                    stride_dk=weight.stride(1),
+                    stride_dn=weight.stride(2),
+                    stride_bias_b=stride_bias_b,
+                    stride_om=bmm_out.stride(0),
+                    HAS_BIAS=has_bias,
+                    ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+                    STORE_SILU=True,
+                )
+            else:
+                silu_jagged: torch.Tensor = jagged
+                jagged_dense_bmm_broadcast_add_kernel[grid](
+                    seq_offsets=offsets,
+                    Jagged=jagged,
+                    Dense=weight,
+                    Bias=bias,
+                    Out=bmm_out,
+                    AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+                    N=ctx.D_out,
+                    K=ctx.D_in,
+                    stride_jm=jagged.stride(0),
+                    stride_db=weight.stride(0),
+                    stride_dk=weight.stride(1),
+                    stride_dn=weight.stride(2),
+                    stride_bias_b=stride_bias_b,
+                    stride_om=bmm_out.stride(0),
+                    HAS_BIAS=has_bias,
+                    ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+                )
+        else:
+            silu_jagged, bmm_out = ctx.saved_tensors[-2:]
+
+        # Backward computations
+        d_output = switch_to_contiguous_if_needed(d_output)
+
+        # TODO: avoid harding-coding BLOCK_D size
+        BLOCK_D = 128
+
+        d_bmm_out: torch.Tensor = torch.empty_like(bmm_out)
+        dw_expanded: torch.Tensor = torch.empty(
+            (g.numel(), triton.cdiv(ctx.D_out, BLOCK_D)), dtype=g.dtype, device=g.device
+        )
+        if g is not None:
+            g_stride = g.stride(0)
+        else:
+            g_stride = 0
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(ctx.D_out, BLOCK_D),
+            triton.cdiv(ctx.L, meta["BLOCK_N"]),
+        )
+        _mul_merge_k_add_bwd[grid](
+            index,
+            bmm_out,
+            g,
+            g_index,
+            d_output,
+            d_bmm_out,
+            dw_expanded,
+            ctx.L,
+            ctx.D_out,
+            g_stride,
+            ctx.k,
+            ctx.has_weight,
+            BLOCK_D=BLOCK_D,
+        )
+
+        d_jagged = torch.empty_like(jagged)
+
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(ctx.D_in, meta["BLOCK_K"]),
+            triton.cdiv(ctx.max_seq_len, meta["BLOCK_M"]),
+            ctx.E,
+        )
+        if ctx.has_silu:
+            _silu_jagged_dense_bmm_broadcast_add_bwd_kernel[grid](
+                seq_offsets=offsets,
+                Jagged=jagged,
+                Dense=weight,
+                D_Out=d_bmm_out,
+                D_Jagged=d_jagged,
+                AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+                N=ctx.D_out,
+                K=ctx.D_in,
+                stride_jm=jagged.stride(0),
+                stride_db=weight.stride(0),
+                stride_dk=weight.stride(1),
+                stride_dn=weight.stride(2),
+                stride_om=d_bmm_out.stride(0),
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            )
+        else:
+            jagged_dense_bmm_broadcast_add_kernel[grid](
+                seq_offsets=offsets,
+                Jagged=d_bmm_out,
+                Dense=weight,
+                Bias=None,
+                Out=d_jagged,
+                AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+                N=ctx.D_in,
+                K=ctx.D_out,
+                stride_jm=d_bmm_out.stride(0),
+                stride_db=weight.stride(0),
+                stride_dk=weight.stride(2),
+                stride_dn=weight.stride(1),
+                stride_bias_b=0,
+                stride_om=d_jagged.stride(0),
+                HAS_BIAS=False,
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            )
+
+        optimize = True
+        if optimize:
+            d_weight, d_bias = triton_jagged_bmm_reduce_sum(
+                JaggedA=silu_jagged,
+                JaggedB=d_bmm_out,
+                offsets=offsets,
+                reduce_sum=has_bias,
+            )
+        else:
+            # tensors below needs to be initialized with zeros as there could be unused
+            # rows in the weight and bias
+            d_weight = torch.zeros_like(weight)
+
+            if has_bias:
+                d_bias = torch.zeros(
+                    (ctx.E, ctx.D_out), device=d_output.device, dtype=d_output.dtype
+                )
+                stride_orb, stride_orn = d_bias.stride(0), d_bias.stride(1)
+            else:
+                d_bias = None
+                stride_orb, stride_orn = 0, 0
+            grid = lambda meta: (  # noqa E731
+                ctx.E,
+                triton.cdiv(ctx.D_in, meta["BLOCK_M"]),
+                triton.cdiv(ctx.D_out, meta["BLOCK_N"]),
+            )
+            _jagged_jagged_bmm_reduce_sum[grid](
+                seq_offsets=offsets,
+                JaggedA=silu_jagged,
+                JaggedB=d_bmm_out,
+                Out=d_weight,
+                ReduceOut=d_bias,
+                M=ctx.D_in,
+                N=ctx.D_out,
+                AUTOTUNE_MAX_SEQ_LEN=triton.next_power_of_2(ctx.max_seq_len),
+                stride_ak=silu_jagged.stride(0),
+                stride_bk=d_bmm_out.stride(0),
+                stride_ob=d_weight.stride(0),
+                stride_om=d_weight.stride(1),
+                stride_on=d_weight.stride(2),
+                stride_orb=stride_orb,
+                stride_orn=stride_orn,
+                REDUCE_JAGGEDB=has_bias,
+                ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            )
+
+        return (
+            None,  # max_seq_len
+            None,  # offsets
+            d_jagged,
+            d_weight.permute(0, 2, 1),
+            d_bias,
+            None,  # index
+            None,  # k
+            # TODO: might need FP32 accumulation
+            (
+                dw_expanded.sum(dim=1, keepdim=True).view(g.shape)
+                if ctx.has_weight
+                else None
+            ),  # gates
+            None,  # gates_index
+            None,  # activation_checkpointing
+            None,  # has_silu
         )

@@ -5,6 +5,7 @@
 from typing import Optional
 
 import torch
+from fast_moe.kernels.pytorch.moe import pytorch_silu_jagged_bmm_combine
 
 from fast_moe.kernels.pytorch.moe_fp8 import (
     pytorch_bmm_weight_rowwise_quant_fp8,
@@ -17,6 +18,7 @@ from fast_moe.kernels.pytorch.moe_fp8 import (
 from fast_moe.kernels.triton.triton_moe_fp8 import (
     triton_bmm_weight_rowwise_quant_fp8,
     triton_index_select_jagged_bmm_fp8,
+    triton_silu_jagged_bmm_combine_fp8,
     triton_silu_jagged_bmm_fp8,
     triton_silu_jagged_fp8,
 )
@@ -116,6 +118,64 @@ def silu_jagged_bmm_fp8(
         )
     elif kernel == KernelType.PYTORCH:
         return pytorch_silu_jagged_bmm(seq_offsets, max_seq_len, jagged, weight, bias)
+    else:
+        raise AssertionError("triton_cc_jagged_bmm_fp8 not implemented yet")
+
+
+def silu_jagged_bmm_combine_fp8(
+    max_seq_len: int,
+    offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    index: torch.Tensor,
+    reverse_index: torch.Tensor,
+    gates: Optional[torch.Tensor] = None,
+    gates_index: Optional[torch.Tensor] = None,
+    activation_checkpointing: bool = False,
+    has_silu: bool = True,
+    kernel: KernelType = KernelType.PYTORCH,
+) -> torch.Tensor:
+    r"""
+    Apply bmm to jagged tensor and weight to fp8.
+
+    Args:
+        seq_offsets (torch.Tensor): offsets of shape [B + 1], where B is the batch size.
+        jagged (torch.Tensor): jagged tensor of shape [L, D_IN].
+        weight (torch.Tensor): weight tensor of shape [D_IN, D_OUT].
+
+    Return:
+        A jagged tensor of shape [L, D_OUT]
+    """
+
+    L, K = reverse_index.shape
+    if kernel == KernelType.TRITON:
+        return triton_silu_jagged_bmm_combine_fp8(
+            max_seq_len=max_seq_len,
+            offsets=offsets,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+            index=index,
+            reverse_index=reverse_index,
+            k=K,
+            gates=gates,
+            gates_index=gates_index,
+            activation_checkpointing=activation_checkpointing,
+            has_silu=has_silu,
+        )
+    elif kernel == KernelType.PYTORCH:
+        return pytorch_silu_jagged_bmm_combine(
+            offsets=offsets,
+            jagged=jagged,
+            weight=weight,
+            bias=bias,
+            index=index,
+            k=K,
+            gates=gates,
+            gates_index=gates_index,
+            has_silu=has_silu,
+        )
     else:
         raise AssertionError("triton_cc_jagged_bmm_fp8 not implemented yet")
 
