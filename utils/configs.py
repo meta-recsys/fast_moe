@@ -1,6 +1,10 @@
 # pyre-strict
 from dataclasses import dataclass
 
+from typing import NamedTuple, Optional
+
+import torch
+
 
 @dataclass
 class SGConfig:
@@ -17,3 +21,9 @@ class SGConfig:
     # silu_jagged_bmm_combine.
     activation_checkpointing: bool = False
     enable_noisy_gating: bool = False
+
+
+class MRNOutput(NamedTuple):
+    x: torch.Tensor
+    loss: Optional[torch.Tensor]
+    load: Optional[torch.Tensor]

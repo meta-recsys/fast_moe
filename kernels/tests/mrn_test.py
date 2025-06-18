@@ -15,9 +15,8 @@ from fast_moe.kernels.utils import (
     KernelType,
 )
 
-from fast_moe.utils.configs import SGConfig
+from fast_moe.utils.configs import MRNOutput, SGConfig
 from fast_moe.utils.enums import ExpertType, LossType, RouterChoice
-from fast_moe.utils.types import MRNOutput
 from fast_moe.utils.utils import (
     _compute_top_logits,
     _create_fused_mlp_weights,
