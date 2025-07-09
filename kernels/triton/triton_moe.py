@@ -38,6 +38,101 @@ class IndexSelectJaggedBmmOption:
     d_weight_split_k_kernel_tma: bool = False
 
 
+@triton_autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_N": BLOCK_N,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_N in [512, 1024]
+        for num_stages in [2, 3]
+        for num_warps in [4, 8]
+    ],
+    key=["AUTOTUNE_N"],
+)
+@triton.jit
+def _fused_swiglu_backward_kernel(
+    d_out_ptr,  # [N] upstream gradient
+    alpha_ptr,  # [N] alpha values (first branch output)
+    beta_ptr,  # [N] beta values (second branch output)
+    a_ptr,  # [N] input to silu (before activation)
+    d_a_ptr,  # [N] output gradient for a
+    d_beta_ptr,  # [N] output gradient for beta
+    N,
+    AUTOTUNE_N,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Fused kernel for SWiGLU backward pass that computes:
+    1. d_alpha = d_out * beta
+    2. d_beta = d_out * alpha
+    3. d_a = triton_silu_backward(a, d_alpha)
+
+    This fuses three separate operations into a single kernel.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < N
+
+    # Load inputs
+    d_out = tl.load(d_out_ptr + offs, mask=mask, other=0.0)
+    alpha = tl.load(alpha_ptr + offs, mask=mask, other=0.0)
+    beta = tl.load(beta_ptr + offs, mask=mask, other=0.0)
+    a = tl.load(a_ptr + offs, mask=mask, other=0.0)
+
+    # Compute d_alpha and d_beta
+    d_alpha = d_out * beta
+    d_beta = d_out * alpha
+
+    # Compute d_a using SiLU backward formula
+    # d_a = d_alpha * sigmoid(a) * (1.0 + a * (1.0 - sigmoid(a)))
+    a_fp32 = a.to(tl.float32)
+    sig = tl.sigmoid(a_fp32)  # σ(a)
+    d_a = d_alpha * sig * (1.0 + a * (1.0 - sig))  # SiLU backward formula
+
+    # Store outputs
+    tl.store(d_a_ptr + offs, d_a.to(d_a_ptr.dtype.element_ty), mask=mask)
+    tl.store(d_beta_ptr + offs, d_beta.to(d_beta_ptr.dtype.element_ty), mask=mask)
+
+
+def triton_fused_swiglu_backward(
+    d_out: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, a: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused SWiGLU backward computation that combines:
+    1. d_alpha = d_out * beta
+    2. d_beta = d_out * alpha
+    3. d_a = triton_silu_backward(a, d_alpha)
+
+    Args:
+        d_out: upstream gradient [N]
+        alpha: first branch output [N]
+        beta: second branch output [N]
+        a: input to silu activation [N]
+
+    Returns:
+        tuple of (d_a, d_beta) gradients
+    """
+    assert d_out.shape == alpha.shape == beta.shape == a.shape
+    assert d_out.device == alpha.device == beta.device == a.device
+
+    n = d_out.numel()
+    d_a = torch.empty_like(a)
+    d_beta = torch.empty_like(beta)
+
+    grid = lambda meta: (  # noqa E731
+        triton.cdiv(n, meta["BLOCK_N"]),
+    )
+    _fused_swiglu_backward_kernel[grid](
+        d_out, alpha, beta, a, d_a, d_beta, n, triton.next_power_of_2(n)
+    )
+
+    return d_a, d_beta
+
+
 @torch.fx.wrap
 def triton_index_select_jagged_bmm(
     max_seq_len: int,
@@ -2163,10 +2258,14 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         _, K, L, A, N = ctx.E, ctx.K, ctx.L, ctx.A, ctx.N
         has_bias = bias is not None
 
-        d_alpha = d_out * beta
-        d_beta = d_out * alpha
-
-        d_a = triton_silu_backward(a, d_alpha)
+        use_fused_swiglu_backward = True
+        # Use fused kernel if enabled, otherwise use separate operations
+        if use_fused_swiglu_backward:
+            d_a, d_beta = triton_fused_swiglu_backward(d_out, alpha, beta, a)
+        else:
+            d_alpha = d_out * beta
+            d_beta = d_out * alpha
+            d_a = triton_silu_backward(a, d_alpha)
 
         d_jagged_expanded_1 = torch.empty(
             (jagged.shape[0], index.shape[1], jagged.shape[1]),
@@ -2635,10 +2734,14 @@ class IndexSelectJaggedGatingBmm(torch.autograd.Function):
         _, K, L, A, N = ctx.E, ctx.K, ctx.L, ctx.A, ctx.N
         has_bias = bias_a is not None
 
-        d_alpha = d_out * beta
-        d_beta = d_out * alpha
-
-        d_a = triton_silu_backward(a, d_alpha)
+        use_fused_swiglu_backward = True
+        # Use fused kernel if enabled, otherwise use separate operations
+        if use_fused_swiglu_backward:
+            d_a, d_beta = triton_fused_swiglu_backward(d_out, alpha, beta, a)
+        else:
+            d_alpha = d_out * beta
+            d_beta = d_out * alpha
+            d_a = triton_silu_backward(a, d_alpha)
 
         d_jagged_expanded_1 = torch.empty(
             (jagged_a.shape[0], index.shape[1], jagged_a.shape[1]),
