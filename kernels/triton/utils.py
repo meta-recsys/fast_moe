@@ -28,18 +28,12 @@ except ImportError:
         # @manual=//triton:triton
         from triton.language.math import fast_dividef, fast_expf
 
-if torch.version.hip:
-    # @manual=//triton:triton
-    from triton.language import exp
-else:
-    # pyre-ignore[16]: Undefined attribute
-    exp = fast_expf
-
 
 @triton.jit
-def fast_sigmoid(x: torch.Tensor) -> torch.Tensor:
+# pyre-ignore[2, 3]
+def fast_sigmoid(x):
     # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
-    return fast_dividef(1.0, 1 + exp(-x))
+    return fast_dividef(1.0, 1 + fast_expf(-x))
 
 
 def next_power_of_2(x: int) -> int:
