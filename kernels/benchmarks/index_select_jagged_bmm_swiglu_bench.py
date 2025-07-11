@@ -1,5 +1,6 @@
 # pyre-strict
 import pickle
+import time
 from typing import List
 
 import click
@@ -123,7 +124,7 @@ def main(
     configs: List[triton.testing.Benchmark] = [
         triton.testing.Benchmark(
             x_names=["num_tokens"],
-            x_vals=[1024, 2048, 4096, 8192, 16384, 32768],
+            x_vals=[num_tokens],
             line_arg="provider",
             line_vals=["triton", "triton_unfused", "pytorch"],
             line_names=["Triton", "Triton_Unfused", "Pytorch"],
@@ -137,6 +138,7 @@ def main(
                 "n": n,
                 "dtype": pt_dtype,
                 "mode": mode,
+                # "num-tokens": num_tokens,
             },
         )
         for mode in (["fwd"] if fwd_only else ["fwd", "bwd"])
@@ -250,8 +252,14 @@ def main(
             # Print a textual summary
             print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
+            mf_path_prefix = "manifold://pyper_traces/"
+            mf_path = f"tree/efficient_module_suite/{provider}_{mode}_{e}_{k}_{m}_{n}_{num_tokens}_{int(time.time())}.json"
+            prof.export_chrome_trace(mf_path_prefix + mf_path)
+            trace_path = f"https://www.internalfb.com/intern/perfdoctor/trace_view?filepath={mf_path}.gz&bucket=pyper_traces"
+            print("Trace link:", trace_path)
+
             # Export to a Chrome Trace file for visual inspection:
-            prof.export_chrome_trace(f"trace_{provider}_{num_tokens}.json")
+            # prof.export_chrome_trace(f"trace_{provider}_{num_tokens}.json")
 
         return ms
 
