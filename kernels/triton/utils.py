@@ -56,7 +56,7 @@ def get_bmm_configs() -> List[triton.Config]:
     for BLOCK_M in [64, 128]:
         for BLOCK_N in [64, 128]:
             for BLOCK_K in [32, 64]:
-                for num_stages in [2, 3]:
+                for num_stages in [2, 3, 5]:
                     for num_warps in [4, 8]:
                         configs.append(
                             triton.Config(

@@ -56,7 +56,6 @@ class IndexSelectJaggedBmmOption:
 @triton.jit
 def _fused_swiglu_backward_kernel(
     d_out_ptr,  # [N] upstream gradient
-    alpha_ptr,  # [N] alpha values (first branch output)
     beta_ptr,  # [N] beta values (second branch output)
     a_ptr,  # [N] input to silu (before activation)
     d_a_ptr,  # [N] output gradient for a
@@ -79,9 +78,13 @@ def _fused_swiglu_backward_kernel(
 
     # Load inputs
     d_out = tl.load(d_out_ptr + offs, mask=mask, other=0.0)
-    alpha = tl.load(alpha_ptr + offs, mask=mask, other=0.0)
+
     beta = tl.load(beta_ptr + offs, mask=mask, other=0.0)
     a = tl.load(a_ptr + offs, mask=mask, other=0.0)
+    a_fp32 = a.to(tl.float32)
+
+    # recompute alpha from a
+    alpha = silu(a_fp32)
 
     # Compute d_alpha and d_beta
     d_alpha = d_out * beta
@@ -89,7 +92,7 @@ def _fused_swiglu_backward_kernel(
 
     # Compute d_a using SiLU backward formula
     # d_a = d_alpha * sigmoid(a) * (1.0 + a * (1.0 - sigmoid(a)))
-    a_fp32 = a.to(tl.float32)
+
     sig = tl.sigmoid(a_fp32)  # σ(a)
     d_a = d_alpha * sig * (1.0 + a * (1.0 - sig))  # SiLU backward formula
 
@@ -99,7 +102,7 @@ def _fused_swiglu_backward_kernel(
 
 
 def triton_fused_swiglu_backward(
-    d_out: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, a: torch.Tensor
+    d_out: torch.Tensor, beta: torch.Tensor, a: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused SWiGLU backward computation that combines:
@@ -116,8 +119,8 @@ def triton_fused_swiglu_backward(
     Returns:
         tuple of (d_a, d_beta) gradients
     """
-    assert d_out.shape == alpha.shape == beta.shape == a.shape
-    assert d_out.device == alpha.device == beta.device == a.device
+    assert d_out.shape == beta.shape == a.shape
+    assert d_out.device == beta.device == a.device
 
     n = d_out.numel()
     d_a = torch.empty_like(a)
@@ -127,7 +130,7 @@ def triton_fused_swiglu_backward(
         triton.cdiv(n, meta["BLOCK_N"]),
     )
     _fused_swiglu_backward_kernel[grid](
-        d_out, alpha, beta, a, d_a, d_beta, n, triton.next_power_of_2(n)
+        d_out, beta, a, d_a, d_beta, n, triton.next_power_of_2(n)
     )
 
     return d_a, d_beta
@@ -2153,17 +2156,14 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         alpha = torch.empty(
             (L * A, N), dtype=jagged.dtype, device=jagged.device
         )  # [L * A, N]
-        alpha_silu = torch.empty(
-            (L * A, N), dtype=jagged.dtype, device=jagged.device
-        )  # [L * A, N]
         beta = torch.empty(
             (L * A, N), dtype=jagged.dtype, device=jagged.device
         )  # [L * A, N]
 
         grid = lambda meta: (  # noqa E731
-            E,
             triton.cdiv(max_seq_len, meta["BLOCK_M"]),
             triton.cdiv(N, meta["BLOCK_N"]),
+            E,
         )
 
         _index_select_jagged_bmm_swiglu[grid](
@@ -2176,7 +2176,6 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
             Bias_P=bias_p,
             Out=output,
             ALPHA=alpha,
-            ALPHA_SILU=alpha_silu,
             BETA=beta,
             # M is only used for trigger autotune
             M=triton.next_power_of_2(max_seq_len),
@@ -2202,7 +2201,6 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
             weight_p,
             bias_p,
             alpha,
-            alpha_silu,
             beta,
         )
         ctx.E = E
@@ -2252,7 +2250,7 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         # bias_p: [E, N]
         # a: [L * A, N]
         # beta: [L * A, N]
-        offsets, index, jagged, weight, bias, weight_p, bias_p, a, alpha, beta = (
+        offsets, index, jagged, weight, bias, weight_p, bias_p, a, beta = (
             ctx.saved_tensors
         )
         _, K, L, A, N = ctx.E, ctx.K, ctx.L, ctx.A, ctx.N
@@ -2261,9 +2259,10 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         use_fused_swiglu_backward = True
         # Use fused kernel if enabled, otherwise use separate operations
         if use_fused_swiglu_backward:
-            d_a, d_beta = triton_fused_swiglu_backward(d_out, alpha, beta, a)
+            d_a, d_beta = triton_fused_swiglu_backward(d_out, beta, a)
         else:
             d_alpha = d_out * beta
+            alpha = torch.nn.functional.silu(a)
             d_beta = d_out * alpha
             d_a = triton_silu_backward(a, d_alpha)
 
@@ -2349,6 +2348,13 @@ class IndexSelectJaggedBmmSwiglu(torch.autograd.Function):
         )
 
 
+@triton.jit
+def silu(A):
+    a_sigmoid = fast_sigmoid(A)
+    A_SILU = A * a_sigmoid
+    return A_SILU
+
+
 @triton_autotune(
     configs=get_bmm_configs(),
     key=["M", "N", "K"],
@@ -2364,7 +2370,6 @@ def _index_select_jagged_bmm_swiglu(
     Bias_P,  # [B, N]
     Out,  # [Sum_B(M), N]
     ALPHA,  # [Sum_B(M), N]
-    ALPHA_SILU,  # [Sum_B(M), N]
     BETA,  # [Sum_B(M), N]
     M,
     N,
@@ -2389,9 +2394,9 @@ def _index_select_jagged_bmm_swiglu(
 
     Split the kernel into (b, m, n) grid, each program processes [BLOCK_M, BLOCK_N] output elements for specific b.
     """
-    off_b = tl.program_id(0)
-    off_m = tl.program_id(1)
-    off_n = tl.program_id(2)
+    off_b = tl.program_id(2)
+    off_m = tl.program_id(0)
+    off_n = tl.program_id(1)
 
     seq_start = tl.load(seq_offsets + off_b, eviction_policy="evict_last")
     seq_end = tl.load(seq_offsets + off_b + 1, eviction_policy="evict_last")
@@ -2406,7 +2411,6 @@ def _index_select_jagged_bmm_swiglu(
     Dense_P += off_b * stride_db
     Out += seq_start.to(tl.int64) * stride_om
     ALPHA += seq_start.to(tl.int64) * stride_om
-    ALPHA_SILU += seq_start.to(tl.int64) * stride_om
     BETA += seq_start.to(tl.int64) * stride_om
 
     offs_m = start_m + tl.arange(0, BLOCK_M)  # [BLOCK_M]
@@ -2475,17 +2479,14 @@ def _index_select_jagged_bmm_swiglu(
         B = accumulator2
 
     # Apply Silu to A
-    a_sigmoid = fast_sigmoid(A)
-    A_SILU = A * a_sigmoid
+    A_SILU = silu(A)
 
     out = (A_SILU * B).to(Out.dtype.element_ty)
 
     # write back [BLOCK_M, BLOCK_N]
     out_ptrs = Out + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
     alpha_ptrs = ALPHA + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
-    alpha_silu_ptrs = (
-        ALPHA_SILU + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
-    )
+    # not writing out alpha_silu
     beta_ptrs = BETA + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :]
     tl.store(
         out_ptrs,
@@ -2496,12 +2497,6 @@ def _index_select_jagged_bmm_swiglu(
     tl.store(
         alpha_ptrs,
         A.to(ALPHA.dtype.element_ty),
-        mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
-        eviction_policy="evict_first",
-    )
-    tl.store(
-        alpha_silu_ptrs,
-        A_SILU.to(ALPHA_SILU.dtype.element_ty),
         mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
         eviction_policy="evict_first",
     )
@@ -2737,7 +2732,7 @@ class IndexSelectJaggedGatingBmm(torch.autograd.Function):
         use_fused_swiglu_backward = True
         # Use fused kernel if enabled, otherwise use separate operations
         if use_fused_swiglu_backward:
-            d_a, d_beta = triton_fused_swiglu_backward(d_out, alpha, beta, a)
+            d_a, d_beta = triton_fused_swiglu_backward(d_out, beta, a)
         else:
             d_alpha = d_out * beta
             d_beta = d_out * alpha
