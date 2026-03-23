@@ -1,0 +1,155 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "torch>=2.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-moe"
+version = "0.1.0"
+description = "High-performance PyTorch library for Mixture of Experts (MoE) with optimized GPU kernels"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Meta AI Research", email = "fastmoe@meta.com"},
+]
+maintainers = [
+    {name = "Meta AI Research", email = "fastmoe@meta.com"},
+]
+keywords = [
+    "mixture-of-experts",
+    "moe",
+    "pytorch",
+    "deep-learning",
+    "gpu-acceleration",
+    "triton",
+    "transformer",
+    "neural-networks",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "triton>=2.1.0",
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "hypothesis>=6.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+    "flake8>=6.0.0",
+    "pre-commit>=3.0.0",
+]
+benchmark = [
+    "click>=8.0.0",
+    "pandas>=1.5.0",
+    "matplotlib>=3.5.0",
+]
+all = [
+    "fast-moe[dev,benchmark]",
+]
+
+[project.urls]
+Homepage = "https://github.com/facebookresearch/fast_moe"
+Repository = "https://github.com/facebookresearch/fast_moe"
+Documentation = "https://fast-moe.readthedocs.io"
+"Bug Tracker" = "https://github.com/facebookresearch/fast_moe/issues"
+
+[tool.setuptools]
+packages = ["fast_moe", "fast_moe.kernels", "fast_moe.kernels.pytorch", "fast_moe.kernels.triton", "fast_moe.modules", "fast_moe.utils"]
+
+[tool.setuptools.package-data]
+fast_moe = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+follow_imports = "normal"
+ignore_missing_imports = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = [
+    "kernels/tests",
+    "modules/tests",
+]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "gpu: marks tests that require GPU (deselect with '-m \"not gpu\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "benchmark: marks tests as benchmarks",
+]
+
+[tool.coverage.run]
+source = ["fast_moe"]
+omit = [
+    "*/tests/*",
+    "*/benchmarks/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

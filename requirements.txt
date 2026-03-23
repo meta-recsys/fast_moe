@@ -1,0 +1,14 @@
+# Core dependencies for FastMoE
+torch>=2.0.0
+triton>=2.1.0
+numpy>=1.20.0
+
+# Note: The following dependencies are currently internal to Meta
+# and need to be replaced with open-source alternatives:
+# - fbgemm_gpu (Facebook GEMM GPU library)
+# - mslk (Meta's machine learning kernel library)
+#
+# For now, these are commented out and the library will use
+# PyTorch-only fallbacks where applicable.
+# fbgemm_gpu
+# mslk
