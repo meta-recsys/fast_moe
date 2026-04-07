@@ -93,10 +93,12 @@ def approx_sample_size(
     conf_int: float, marg_err: float, mean: float, std_dev: float
 ) -> int:
     q_val = 1.0 - (1.0 - conf_int) / 2
+    # pyrefly: ignore [missing-attribute]
     z_val = stats.norm.ppf(q=q_val)
     n_approx = int(((z_val * std_dev) / (marg_err * mean)) ** 2) + 1
     if n_approx == 1:
         return n_approx
+    # pyrefly: ignore [missing-attribute]
     t_val = stats.t.ppf(q=q_val, df=n_approx - 1)
     n_approx = int(((t_val * std_dev) / (marg_err * mean)) ** 2) + 1
     return n_approx
@@ -136,7 +138,6 @@ class Timer(abc.ABC):
 
         return TimerResult(
             sample_size=n,
-            # pyre-ignore[16]
             mean_sec=d.mean().t,
             corrected_mean_sec=d[
                 int(n * self._params.lower_percentile_threshold) : int(
@@ -146,11 +147,8 @@ class Timer(abc.ABC):
             .mean()
             .t,
             median_sec=float(d["t"].quantile(0.50)),
-            # pyre-ignore[16]
             stddev_sec=d.std().t,
-            # pyre-ignore[16]
             stderr_sec=d.std().t / math.sqrt(len(d)),
-            # pyre-ignore[16]
             relerr_percent=d.std().t / d.mean().t * 100,
             p75_sec=float(d["t"].quantile(0.75)),
             p90_sec=float(d["t"].quantile(0.9)),

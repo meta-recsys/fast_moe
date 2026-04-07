@@ -102,9 +102,11 @@ def _grouped_gemm_fp8_rowwise_bias(
             if USE_TMA_STORE:
                 # pyre-ignore
                 tl.extra.cuda.experimental_device_tensormap_create2d(
+                    # pyrefly: ignore [bad-argument-type]
                     desc_ptr=c_desc_ptr,
                     global_address=c_ptr + M_start_offset * N,
                     load_size=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+                    # pyrefly: ignore [bad-argument-type]
                     global_size=[m_size, n_size],
                     element_ty=c_ptr.dtype.element_ty,
                 )
@@ -121,7 +123,6 @@ def _grouped_gemm_fp8_rowwise_bias(
                 accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 tl.static_assert(K % BLOCK_SIZE_K == 0)
                 if USE_TMA_LOAD:
-                    # pyre-ignore[16]
                     m_offset = (M_start_offset + tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (N_start_offset + tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
                     for k_offset in range(0, K, BLOCK_SIZE_K):
@@ -267,6 +268,7 @@ def _grouped_gemm(
     def grid(META):
         if USE_TMA_LOAD:
             nonlocal desc_helper  # noqa: F824
+            # pyrefly: ignore [missing-attribute]
             desc_helper.fill_2d_tma_descriptor(
                 "x",
                 x.data_ptr(),
@@ -277,6 +279,7 @@ def _grouped_gemm(
                 x.element_size(),
             )
 
+            # pyrefly: ignore [missing-attribute]
             desc_helper.fill_2d_tma_descriptor(
                 "w",
                 w.data_ptr(),

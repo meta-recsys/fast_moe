@@ -26,7 +26,6 @@ from hypothesis import given, seed, settings, strategies as st, Verbosity
 class MOEFp8Test(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     @seed(0)
-    # pyre-ignore
     @given(
         max_seq_len=st.sampled_from([32, 64, 200]),
         min_seq_len=st.just(10),
@@ -129,7 +128,6 @@ class MOEFp8Test(unittest.TestCase):
 
     @unittest.skipIf(*gpu_unavailable)
     @seed(0)
-    # pyre-ignore
     @given(
         E=st.sampled_from([4, 8]),
         D_in=st.sampled_from([16, 32, 64]),
@@ -302,7 +300,6 @@ class MOEFp8Test(unittest.TestCase):
                 )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
@@ -338,7 +335,6 @@ class MOEFp8Test(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),

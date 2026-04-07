@@ -179,7 +179,6 @@ def _silu_jagged_fp8_kernel(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs + k,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) & ((k + offs_k)[None, :] < K),
             other=0.0,
         )
@@ -722,7 +721,6 @@ def _jagged_bmm_fp8_kernel(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs + k,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) & ((k + offs_k)[None, :] < K),
             other=0.0,
         )
@@ -739,7 +737,6 @@ def _jagged_bmm_fp8_kernel(
 
     inv_w_scale = 1.0 / w_scale
     inv_j_scale = 1.0 / j_scale
-    # pyre-ignore[16]: Undefined attribute [16]: `float` has no attribute `__getitem__`.
     scale = inv_j_scale[:, None] * inv_w_scale[None, :]
     accumulator = accumulator * scale
 
@@ -840,7 +837,6 @@ def _index_select_jagged_bmm(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -865,7 +861,6 @@ def _index_select_jagged_bmm(
     # Invert vector, then multiply on matrix for speed.
     inv_jg_scale = 1.0 / jg_scale
     inv_dn_scale = 1.0 / dn_scale
-    # pyre-ignore[16]: Undefined attribute [16]: `float` has no attribute `__getitem__`.
     accumulator = (accumulator * inv_jg_scale[:, None]) * inv_dn_scale[None, :]
 
     if HAS_BIAS:
@@ -959,7 +954,6 @@ def _jagged_bmm_index_add(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -981,7 +975,6 @@ def _jagged_bmm_index_add(
     # Invert vector, then multiply on matrix for speed.
     inv_jg_scale = 1.0 / jg_scale
     inv_dn_scale = 1.0 / dn_scale
-    # pyre-ignore[16]: Undefined attribute [16]: `float` has no attribute `__getitem__`.
     accumulator = (accumulator * inv_jg_scale[:, None]) * inv_dn_scale[None, :]
 
     # load index for all rows to be processed by this block
@@ -1085,7 +1078,6 @@ def _indexed_jagged_jagged_bmm(
         )  # [BLOCK_M, BLOCK_K]
         jg_a = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -1108,7 +1100,6 @@ def _indexed_jagged_jagged_bmm(
     # Invert vector, then multiply on matrix for speed.
     inv_ja_scale = 1.0 / ja_scale
     inv_jb_scale = 1.0 / jb_scale
-    # pyre-ignore[16]: Undefined attribute [16]: `float` has no attribute `__getitem__`.
     accumulator = (accumulator * inv_ja_scale[:, None]) * inv_jb_scale[None, :]
 
     # write back [BLOCK_M, BLOCK_N]

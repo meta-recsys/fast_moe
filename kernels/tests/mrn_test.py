@@ -258,7 +258,9 @@ class SGMoE(torch.nn.Module):
                 noisy_logits,  # pyre-ignore
                 noise_stddev,  # pyre-ignore
                 top_logits,
+                # pyrefly: ignore [bad-argument-type]
                 self.mean,
+                # pyrefly: ignore [bad-argument-type]
                 self.std,
                 self.k,
             )
@@ -384,6 +386,7 @@ class OrigDispatcherImpl(object):
 
     def dispatch(self, expert_inputs: torch.Tensor) -> Tuple[torch.Tensor]:
         expert_input = expert_inputs[self._batch_index].squeeze(1)
+        # pyrefly: ignore [bad-return]
         return torch.split(expert_input, self._part_sizes, dim=0)
 
     def combine(
@@ -503,7 +506,6 @@ class OrigSGMoEImpl(torch.nn.Module):
     def _cv_squared(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         if x.shape[0] == 1:
             return torch.tensor([0], device=x.device).to(x.dtype)
-        # pyre-ignore
         return x.float().var() / (x.float().mean() ** 2 + eps)
 
     def _prob_in_top_k(
@@ -530,6 +532,7 @@ class OrigSGMoEImpl(torch.nn.Module):
             torch.gather(top_values_flat, 0, threshold_positions_if_out), 1
         )
 
+        # pyrefly: ignore [bad-argument-type]
         normal = Normal(self.mean, self.std, validate_args=False)
         prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
         prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)

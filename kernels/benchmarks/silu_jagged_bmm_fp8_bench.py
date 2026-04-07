@@ -14,8 +14,6 @@ import torch
 import triton
 from fast_moe.kernels.moe_fp8 import silu_jagged_bmm_fp8
 from fast_moe.kernels.utils import KernelType
-
-# pyre-fixme[21]: Could not find name `ProfilerActivity` in `torch.profiler`.
 from torch.profiler import profile, ProfilerActivity
 
 
@@ -139,7 +137,6 @@ def main(
 
         if enable_profile:
             with profile(
-                # pyre-fixme[16]: Module `torch.profiler` has no attribute `ProfilerActivity`.
                 activities=[ProfilerActivity.CUDA],
                 record_shapes=True,
                 profile_memory=True,

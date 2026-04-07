@@ -21,7 +21,6 @@ from torch.functional import F
 
 class GeneralOpsTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         N=st.sampled_from([391336 * 2 * 1024, 32768 * 32 * 128]),
         dtype=st.sampled_from(
@@ -35,7 +34,6 @@ class GeneralOpsTest(unittest.TestCase):
         max_examples=20,
         deadline=None,
     )
-    # pyre-ignore[2]
     def test_triton_silu_backward(
         self,
         N: int,

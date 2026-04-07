@@ -36,7 +36,6 @@ except ImportError:
 @triton.jit
 # pyre-ignore[2, 3]
 def fast_sigmoid(x):
-    # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
     return fast_dividef(1.0, 1 + fast_expf(-x))
 
 
@@ -127,6 +126,7 @@ class TritonAutotuner(Autotuner):
             logger.warning(f"Only keep first config for {fn} due to dev mode")
             del self.configs[1:]
         self.bench_time = -1
+        # pyrefly: ignore [bad-override]
         self.best_config: List[triton.Config] = []
 
     @property

@@ -13,8 +13,6 @@ from datetime import datetime
 import torch
 from fast_moe.kernels.moe_fp8 import silu_jagged_bmm_fp8
 from fast_moe.kernels.utils import KernelType
-
-# pyre-fixme[21]
 from torch.profiler import profile, ProfilerActivity
 
 
@@ -59,7 +57,6 @@ def create_profiler() -> torch.profiler.profile:
         schedule=torch.profiler.schedule(
             skip_first=50, wait=1, warmup=2, active=5, repeat=1
         ),
-        # pyre-fixme[16]: Module `profiler` has no attribute `ProfilerActivity`.
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         on_trace_ready=manifold_trace_handler(),
         record_shapes=True,

@@ -126,7 +126,6 @@ class ModuleFactory(abc.ABC):
     ) -> Dict[str, Any]:
         pass
 
-    # pyre-ignore
     def run_module(
         self,
         module: torch.nn.Module,
@@ -199,12 +198,10 @@ class ModuleBench(abc.ABC):
             worker_name=f"{self._module_factory.module_name()}-{self.benchmark_type().lower()}",
         )
         activities = [
-            # pyre-fixme[16]: Module `profiler` has no attribute `ProfilerActivity`.
             torch.profiler.ProfilerActivity.CUDA,
         ]
         if not self._profiler_params.gpu_only:
             activities.append(
-                # pyre-fixme[16]: Module `profiler` has no attribute `ProfilerActivity`.
                 torch.profiler.ProfilerActivity.CPU,
             )
         profiler = profile(
@@ -221,6 +218,7 @@ class ModuleBench(abc.ABC):
             with_flops=True,
         )
 
+        # pyrefly: ignore [bad-context-manager]
         with suppress_stdout_stderr():
             nvtx_range_id = nvtx.range_start("benchmark.profile")
             profiler.start()
@@ -323,7 +321,6 @@ class TrainModuleBench(ModuleBench):
         )
 
         if pt2_config is not None:
-            # pyre-ignore
             self.run_module = torch.compile(
                 self.run_module,
                 dynamic=pt2_config.dynamic_shapes,

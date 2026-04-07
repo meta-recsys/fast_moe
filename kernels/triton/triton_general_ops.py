@@ -264,7 +264,6 @@ def _kernel_jagged_reduce_sum(
     for k in range(0, seq_len, BLOCK_K):
         jg_b = tl.load(
             jg_b_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_n[None, :] < N) and ((k + offs_k)[:, None] < seq_len),
             other=0.0,
         )

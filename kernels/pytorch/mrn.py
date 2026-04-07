@@ -55,18 +55,15 @@ class OrigDispatcherImpl(object):
         self._num_experts = num_experts
         non_zero_gate = torch.nonzero(gates)
         sorted_experts, index_sorted_experts = non_zero_gate.sort(0)
-        # pyre-ignore
         _, self._expert_index = sorted_experts.split(1, dim=1)
-        # pyre-ignore
         self._batch_index = non_zero_gate[index_sorted_experts[:, 1], 0]
-        # pyre-ignore
         self._part_sizes = (gates > 0).sum(0).tolist()
         gates_exp = gates[self._batch_index.flatten()]
-        # pyre-ignore
         self._nonzero_gates = torch.gather(gates_exp, 1, self._expert_index)
 
     def dispatch(self, expert_inputs: torch.Tensor) -> Tuple[torch.Tensor]:
         expert_input = expert_inputs[self._batch_index].squeeze(1)
+        # pyrefly: ignore [bad-return]
         return torch.split(expert_input, self._part_sizes, dim=0)
 
     def combine(
@@ -185,7 +182,6 @@ class OrigSGMoEImpl(torch.nn.Module):
     def _cv_squared(self, x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         if x.shape[0] == 1:
             return torch.tensor([0], device=x.device).to(x.dtype)
-        # pyre-ignore
         return x.float().var() / (x.float().mean() ** 2 + eps)
 
     def _prob_in_top_k(
@@ -212,6 +208,7 @@ class OrigSGMoEImpl(torch.nn.Module):
             torch.gather(top_values_flat, 0, threshold_positions_if_out), 1
         )
 
+        # pyrefly: ignore [bad-argument-type]
         normal = Normal(self.mean, self.std, validate_args=False)
         prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
         prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)

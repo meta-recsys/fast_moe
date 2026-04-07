@@ -247,7 +247,6 @@ def _index_select_jagged_bmm(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -350,7 +349,6 @@ def _jagged_bmm_index_add(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -458,6 +456,7 @@ def _indexed_jagged_jagged_bmm_reduce_sum(
             if off_m == 0:
                 tl.store(
                     out_reduce_ptrs,  # pyre-ignore [61]
+                    # pyrefly: ignore [unbound-name]
                     acc_reduce.to(ReduceOut.dtype.element_ty),
                     mask=(offs_n < N),
                 )
@@ -480,7 +479,6 @@ def _indexed_jagged_jagged_bmm_reduce_sum(
         )  # [BLOCK_M, BLOCK_K]
         jg_a = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -493,6 +491,7 @@ def _indexed_jagged_jagged_bmm_reduce_sum(
         accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
         if REDUCE_JAGGEDB:
             if off_m == 0:
+                # pyrefly: ignore [unbound-name]
                 acc_reduce += tl.sum(jg_b, axis=0)
 
         idx_ptrs += BLOCK_K
@@ -511,6 +510,7 @@ def _indexed_jagged_jagged_bmm_reduce_sum(
             # write back [BLOCK_N]
             tl.store(
                 out_reduce_ptrs,  # pyre-ignore [61]
+                # pyrefly: ignore [unbound-name]
                 acc_reduce.to(ReduceOut.dtype.element_ty),
                 mask=(offs_n < N),
             )
@@ -1188,7 +1188,6 @@ def _jagged_bmm_index_add_3D(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )
@@ -1279,7 +1278,7 @@ def _indexed_jagged_jagged_bmm_reduce_sum_3D(
         )
         if off_m == 0:
             tl.store(
-                out_reduce_ptrs,  # pyre-ignore [61]
+                out_reduce_ptrs,
                 acc_reduce.to(ReduceOut.dtype.element_ty),
                 mask=(offs_n < N),
             )
@@ -1300,7 +1299,6 @@ def _indexed_jagged_jagged_bmm_reduce_sum_3D(
         )
         jg_a = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )
@@ -1326,7 +1324,7 @@ def _indexed_jagged_jagged_bmm_reduce_sum_3D(
 
     if off_m == 0:
         tl.store(
-            out_reduce_ptrs,  # pyre-ignore [61]
+            out_reduce_ptrs,
             acc_reduce.to(ReduceOut.dtype.element_ty),
             mask=(offs_n < N),
         )
@@ -1540,7 +1538,6 @@ def _index_select_jagged_bmm_3D(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )
@@ -1629,7 +1626,6 @@ def _jagged_jagged_bmm(
     for k in range(0, seq_len, BLOCK_K):
         jg_a = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )
@@ -1740,7 +1736,6 @@ def _fused_jagged_jagged_bmm_reduce_sum(
     for k in range(0, seq_len, BLOCK_K):
         jg_a = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )
@@ -1753,6 +1748,7 @@ def _fused_jagged_jagged_bmm_reduce_sum(
         accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
         if REDUCE_JAGGEDB:
             if off_m == 0:
+                # pyrefly: ignore [unbound-name]
                 acc_reduce += jg_b.to(tl.float32)
 
         jg_a_ptrs += BLOCK_K * stride_ak
@@ -1939,14 +1935,19 @@ def _jagged_jagged_bmm_split_k(
                 JaggedB.dtype.element_ty,
             )
         else:
+            # pyrefly: ignore [unsupported-operation]
             offs_k_block = k_start + k * BLOCK_K + offs_k[:, None]
             jg_a = tl.load(
+                # pyrefly: ignore [unsupported-operation]
                 JaggedA + offs_k_block * stride_ak + offs_m[None, :],
+                # pyrefly: ignore [unsupported-operation]
                 mask=(offs_m[None, :] < M) and (offs_k_block < seq_len),
                 other=0.0,
             )
             jg_b = tl.load(
+                # pyrefly: ignore [unsupported-operation]
                 JaggedB + offs_k_block * stride_bk + offs_n[None, :],
+                # pyrefly: ignore [unsupported-operation]
                 mask=(offs_n[None, :] < N) and (offs_k_block < seq_len),
                 other=0.0,
             )
@@ -1969,6 +1970,7 @@ def _jagged_jagged_bmm_split_k(
         tl.atomic_add(
             out_ptrs,
             out,
+            # pyrefly: ignore [unsupported-operation]
             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
             sem="relaxed",
         )
@@ -2595,7 +2597,6 @@ def _index_select_jagged_bmm_swiglu(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -3068,13 +3069,11 @@ def _index_select_jagged_gating_bmm(
     for k in range(0, K, BLOCK_K):
         jga = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
         jgb = tl.load(
             jg_b_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )  # [BLOCK_M, BLOCK_K]
@@ -3227,7 +3226,6 @@ def _silu_jagged_dense_bmm_broadcast_add_fwd_kernel(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) & ((k + offs_k)[None, :] < K),
             other=0.0,
         )
@@ -3324,7 +3322,6 @@ def jagged_dense_bmm_broadcast_add_kernel(
     for k in range(0, K, BLOCK_K):
         jg = tl.load(
             jg_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
             other=0.0,
         )
@@ -3409,6 +3406,7 @@ def _jagged_jagged_bmm_reduce_sum(
             if off_m == 0:
                 tl.store(
                     out_reduce_ptrs,  # pyre-ignore [61]
+                    # pyrefly: ignore [unbound-name]
                     acc_reduce.to(ReduceOut.dtype.element_ty),
                     mask=(offs_n < N),
                 )
@@ -3423,7 +3421,6 @@ def _jagged_jagged_bmm_reduce_sum(
     for k in range(0, seq_len, BLOCK_K):
         jg_a = tl.load(
             jg_a_ptrs,
-            # pyre-fixme[16]: `int` has no attribute `__getitem__`.
             mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )
@@ -3436,6 +3433,7 @@ def _jagged_jagged_bmm_reduce_sum(
         accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
         if REDUCE_JAGGEDB:
             if off_m == 0:
+                # pyrefly: ignore [unbound-name]
                 acc_reduce += tl.sum(jg_b.to(tl.float32), axis=0)
 
         jg_a_ptrs += BLOCK_K * stride_ak
@@ -3447,6 +3445,7 @@ def _jagged_jagged_bmm_reduce_sum(
         if off_m == 0:
             tl.store(
                 out_reduce_ptrs,  # pyre-ignore [61]
+                # pyrefly: ignore [unbound-name]
                 acc_reduce.to(ReduceOut.dtype.element_ty),
                 mask=(offs_n < N),
             )
@@ -3525,7 +3524,6 @@ def _silu_jagged_dense_bmm_broadcast_add_bwd_kernel(
     jg_ptrs = Jagged + offs_m[:, None] * stride_jm + offs_k[None, :]
     jg = tl.load(
         jg_ptrs,
-        # pyre-fixme[16]: `int` has no attribute `__getitem__`.
         mask=(offs_m[:, None] < seq_len) & (offs_k[None, :] < K),
         other=0.0,
     )
@@ -3667,7 +3665,7 @@ class SiluJaggedBmmCombine(torch.autograd.Function):
         jagged = switch_to_contiguous_if_needed(jagged)
         has_bias = bias is not None
         if has_bias:
-            bias = switch_to_contiguous_if_needed(bias)  # pyre-ignore
+            bias = switch_to_contiguous_if_needed(bias)
             stride_bias_b = bias.stride(0)
         else:
             stride_bias_b = 0

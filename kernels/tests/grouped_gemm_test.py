@@ -56,9 +56,7 @@ class TestGroupedGEMM(unittest.TestCase):
                 [m_ends[i] - m_starts[i] for i in range(G)], device=device
             ).to(torch.int32)
 
-            # pyre-ignore[16]
             a_fp8, a_scale = quantize_fp8_row(a)
-            # pyre-ignore[16]
             b_fp8, b_scale = quantize_fp8_row(b)
 
             result = grouped_gemm_fp8_rowwise(

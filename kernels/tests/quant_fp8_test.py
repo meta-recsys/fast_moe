@@ -21,7 +21,6 @@ from hypothesis import given, settings, strategies as st, Verbosity
 
 class Fp8RowwiseTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         shape=st.sampled_from([(32, 16), (32, 8, 16), (7, 9, 13), (51, 5)]),
         transpose=st.booleans(),

@@ -29,7 +29,6 @@ from hypothesis import given, settings, strategies as st, Verbosity
 
 class MOETest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
@@ -81,7 +80,6 @@ class MOETest(unittest.TestCase):
                 )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
@@ -295,7 +293,6 @@ class MOETest(unittest.TestCase):
                 )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         N=st.sampled_from([2, 32, 33, 100, 512, 1000]),
         # K must be power of 2 for now
@@ -399,7 +396,6 @@ class MOETest(unittest.TestCase):
             )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
@@ -727,7 +723,6 @@ class MOETest(unittest.TestCase):
                     )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         L=st.sampled_from([16, 32, 100, 500]),
         E=st.sampled_from([4, 8, 16]),
@@ -743,7 +738,6 @@ class MOETest(unittest.TestCase):
         has_bias=st.booleans(),
         allow_tf32=st.sampled_from([False]),
     )
-    # pyre-ignore[2]
     @settings(
         verbosity=Verbosity.verbose,
         max_examples=20,
@@ -951,7 +945,6 @@ class MOETest(unittest.TestCase):
                     )
 
     @unittest.skipIf(*gpu_unavailable)
-    # pyre-ignore
     @given(
         max_seq_len=st.sampled_from([32, 64, 200]),
         min_seq_len=st.just(32),
