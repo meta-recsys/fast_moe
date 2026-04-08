@@ -9,6 +9,7 @@ import os
 import random
 import string
 from datetime import datetime
+from typing import Callable
 
 import torch
 from fast_moe.kernels.moe_fp8 import silu_jagged_bmm_fp8
@@ -25,14 +26,12 @@ def get_kernel(provider: str) -> KernelType:
         raise ValueError(f"Unknown provider {provider}")
 
 
-# pyre-ignore[3]
-def manifold_trace_handler():
+def manifold_trace_handler() -> Callable[[torch.profiler.profile], None]:
     """
     Outputs tracing files to directory of ``manifold://perfdoctor_gpu_traces_test/tree/traces/test/``.
     """
 
-    # pyre-ignore[2]
-    def handler_fn(prof) -> None:
+    def handler_fn(prof: torch.profiler.profile) -> None:
         trace_filename = (
             "silu_jagged_bmm_fp8_pid"
             + str(os.getpid())
