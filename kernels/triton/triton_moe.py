@@ -5,7 +5,7 @@
 
 #!/usr/bin/env python3
 
-# pyre-unsafe
+# pyre-strict
 
 import dataclasses
 from typing import List, Optional, Tuple

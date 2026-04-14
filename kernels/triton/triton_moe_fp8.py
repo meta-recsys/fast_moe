@@ -369,11 +369,11 @@ class SiluJaggedBmmFp8(torch.autograd.Function):
     # pyre-ignore[14]
     def forward(
         ctx,
-        seq_offsets,
-        max_seq_len,
-        jagged,
-        weight,
-        bias,
+        seq_offsets: torch.Tensor,
+        max_seq_len: int,
+        jagged: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
     ) -> torch.Tensor:
         E, D_in, D_out = weight.shape
         L = jagged.shape[0]
@@ -468,11 +468,11 @@ class SiluJaggedBmmFp8GroupedGemm(torch.autograd.Function):
     # pyre-ignore[14]
     def forward(
         ctx,
-        seq_offsets,
-        max_seq_len,
-        jagged,
-        weight,
-        bias,
+        seq_offsets: torch.Tensor,
+        max_seq_len: int,
+        jagged: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
     ) -> torch.Tensor:
         E, D_out, D_in = weight.shape
         L = jagged.shape[0]

@@ -3,10 +3,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-unsafe
+# pyre-strict
 import functools
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import mslk.gemm.triton.utils as utils
 import torch
@@ -265,7 +265,7 @@ def _grouped_gemm(
             dtype=torch.uint8,
         )
 
-    def grid(META):
+    def grid(META: Dict[str, Any]) -> Tuple[int]:
         if USE_TMA_LOAD:
             nonlocal desc_helper  # noqa: F824
             # pyrefly: ignore [missing-attribute]
