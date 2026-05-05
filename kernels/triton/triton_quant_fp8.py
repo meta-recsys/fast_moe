@@ -5,9 +5,9 @@
 
 #!/usr/bin/env python3
 
-# pyre-unsafe
+# pyre-strict
 
-from typing import Optional, Tuple
+from __future__ import annotations
 
 import torch
 
@@ -27,7 +27,7 @@ MAX_FP8 = 448.0
 
 def triton_rowwise_quant_fp8(
     a: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Call the triton kernel to quantize to fp8 with row-wise scalings.
 
@@ -43,7 +43,7 @@ def triton_rowwise_quant_fp8(
 
 def triton_transpose_rowwise_quant_fp8(
     a: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Call the triton kernel to transpose on -2 and -1 dimensions, and then quantize to fp8 with row-wise scalings.
 
@@ -58,8 +58,8 @@ def triton_transpose_rowwise_quant_fp8(
 
 
 def _triton_transpose_rowwise_quant_fp8(
-    a: torch.Tensor, a_fp8: Optional[torch.Tensor] = None, transpose: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    a: torch.Tensor, a_fp8: torch.Tensor | None = None, transpose: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
     if transpose:
         if len(a.shape) == 2:
             m1 = 1
@@ -235,7 +235,7 @@ def _rowwise_quant_fp8_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     APPLY_SILU: tl.constexpr,
-):
+) -> None:
     MAX_FP8 = 448.0
 
     off_m = tl.program_id(0) * BLOCK_M
