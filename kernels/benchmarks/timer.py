@@ -138,6 +138,7 @@ class Timer(abc.ABC):
 
         return TimerResult(
             sample_size=n,
+            # pyrefly: ignore [missing-attribute]
             mean_sec=d.mean().t,
             corrected_mean_sec=d[
                 int(n * self._params.lower_percentile_threshold) : int(
@@ -147,8 +148,11 @@ class Timer(abc.ABC):
             .mean()
             .t,
             median_sec=float(d["t"].quantile(0.50)),
+            # pyrefly: ignore [missing-attribute]
             stddev_sec=d.std().t,
+            # pyrefly: ignore [missing-attribute]
             stderr_sec=d.std().t / math.sqrt(len(d)),
+            # pyrefly: ignore [missing-attribute]
             relerr_percent=d.std().t / d.mean().t * 100,
             p75_sec=float(d["t"].quantile(0.75)),
             p90_sec=float(d["t"].quantile(0.9)),
