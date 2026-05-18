@@ -6,9 +6,10 @@
 
 # pyre-ignore-all-errors
 
+from __future__ import annotations
+
 import functools
 import logging
-from typing import Optional
 
 import mslk.gemm.triton.utils as utils
 import torch
@@ -86,7 +87,13 @@ _AMD_CONFIGS = [
 ]
 
 
-def early_config_prune(configs, named_args, dtsize=None, dtype=None, **kwargs):
+def early_config_prune(
+    configs: list[triton.Config],
+    named_args,
+    dtsize: int | None = None,
+    dtype=None,
+    **kwargs,
+) -> list[triton.Config]:
     device = torch.cuda.current_device()
     # BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
     if dtsize is None:
@@ -778,13 +785,13 @@ def _grouped_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
     m_sizes: torch.Tensor,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
     use_fast_accum: bool = False,
     allow_tf32: bool = True,
     use_warp_specialization: bool = False,
     out_type: torch.dtype = torch.bfloat16,
-    out_index: Optional[torch.Tensor] = None,
+    out_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     USE_TMA_LOAD = not torch.version.hip
     USE_TMA_STORE = False
@@ -858,7 +865,7 @@ def _grouped_gemm(
             dtype=torch.uint8,
         )
 
-    def grid(META):
+    def grid(META) -> tuple[int]:
         if USE_TMA_LOAD:
             nonlocal desc_helper  # noqa: F824
             desc_helper.fill_2d_tma_descriptor(
@@ -959,9 +966,8 @@ def grouped_gemm(
     *,
     _use_warp_specialization: bool = False,
     _out_type: torch.dtype = torch.bfloat16,  # output dtype
-    _out_index: Optional[
-        torch.Tensor
-    ] = None,  # if sepicified, output will be written to the index-th output
+    _out_index: torch.Tensor
+    | None = None,  # if sepicified, output will be written to the index-th output
 ) -> torch.Tensor:
     return _grouped_gemm(
         x,
