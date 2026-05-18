@@ -5,9 +5,9 @@
 
 #!/usr/bin/env python3
 
-# pyre-unsafe
+# pyre-strict
 
-from typing import List, Optional
+from __future__ import annotations
 
 import torch
 
@@ -19,7 +19,7 @@ import triton.language as tl
 from fast_moe.kernels.triton.utils import triton_autotune
 
 
-def _get_transpose_configs() -> List[triton.Config]:
+def _get_transpose_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_N in [64, 128, 256]:
         for BLOCK_M in [64, 128, 256]:
@@ -76,17 +76,17 @@ def _kernel_index_transpose(
     tl.store(OUT + out_offset, data, mask=mask)
 
 
-def triton_transpose(x):
+def triton_transpose(x: torch.Tensor) -> torch.Tensor:
     return triton_index_transpose(x, None)
 
 
-def triton_index_select(x, index: torch.Tensor):
+def triton_index_select(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return triton_index_transpose(x, index, transpose=False)
 
 
 def triton_index_transpose(
-    input, index: Optional[torch.Tensor] = None, transpose: bool = True
-):
+    input: torch.Tensor, index: torch.Tensor | None = None, transpose: bool = True
+) -> torch.Tensor:
     """
     Transpose a jagged tensor with index. output = input[index].T.contiguous()
     Args:
@@ -132,7 +132,7 @@ def triton_index_transpose(
     return output
 
 
-def _get_sum_dim1_configs() -> List[triton.Config]:
+def _get_sum_dim1_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_K in [32, 64, 128, 256]:
         for num_warps in [4, 8, 16]:
@@ -180,7 +180,7 @@ def _kernel_sum_dim1(
     tl.store(out_ptr + out_offs, accumulator.to(out_ptr.dtype.element_ty), mask=mask_k)
 
 
-def triton_sum_dim1(x: torch.Tensor):
+def triton_sum_dim1(x: torch.Tensor) -> torch.Tensor:
     """
     Sum along the second dimension of a 3D tensor. Accumulate in fp32.
     Summing along dim=1 was supposed to be faster than dim=0.
