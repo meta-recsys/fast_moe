@@ -4,9 +4,11 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
+from __future__ import annotations
+
 import functools
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import mslk.gemm.triton.utils as utils
 import torch
@@ -208,7 +210,7 @@ def _grouped_gemm(
     m_sizes: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     use_fast_accum: bool = False,
     use_warp_specialization: bool = False,
 ) -> torch.Tensor:
@@ -265,7 +267,7 @@ def _grouped_gemm(
             dtype=torch.uint8,
         )
 
-    def grid(META: Dict[str, Any]) -> Tuple[int]:
+    def grid(META: dict[str, Any]) -> tuple[int]:
         if USE_TMA_LOAD:
             nonlocal desc_helper  # noqa: F824
             # pyrefly: ignore [missing-attribute]
@@ -325,7 +327,7 @@ def grouped_gemm_fp8_rowwise_bias(
     m_sizes: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     use_fast_accum: bool = True,
     *,
     _use_warp_specialization: bool = False,
