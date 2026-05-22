@@ -6,8 +6,9 @@
 # pyre-strict
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import logging
-from typing import List
 
 import torch
 
@@ -54,7 +55,7 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous()
 
 
-def get_bmm_configs() -> List[triton.Config]:
+def get_bmm_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_M in [64, 128]:
         for BLOCK_N in [64, 128]:
@@ -75,7 +76,7 @@ def get_bmm_configs() -> List[triton.Config]:
     return configs
 
 
-def get_bmm_split_k_configs() -> List[triton.Config]:
+def get_bmm_split_k_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_M in [64, 128]:
         for BLOCK_N in [64, 128]:
@@ -98,7 +99,7 @@ def get_bmm_split_k_configs() -> List[triton.Config]:
     return configs
 
 
-def _get_rowwise_quant_fp8_configs() -> List[triton.Config]:
+def _get_rowwise_quant_fp8_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_M in [16, 32, 64, 128]:
         for BLOCK_K in [16, 32, 64]:
@@ -127,7 +128,7 @@ class TritonAutotuner(Autotuner):
             del self.configs[1:]
         self.bench_time = -1
         # pyrefly: ignore [bad-override]
-        self.best_config: List[triton.Config] = []
+        self.best_config: list[triton.Config] = []
 
     @property
     def kernel_name(self) -> str:
@@ -138,7 +139,7 @@ class TritonAutotuner(Autotuner):
         )
 
     # pyre-ignore[2]
-    def prune_configs(self, kwargs) -> List[triton.Config]:
+    def prune_configs(self, kwargs) -> list[triton.Config]:
         if is_dev_mode():
             return self.configs[:1]
         else:
@@ -168,8 +169,8 @@ class TritonAutotuner(Autotuner):
 
 # pyre-ignore
 def triton_autotune(
-    configs: List[triton.Config],
-    key: List[str],
+    configs: list[triton.Config],
+    key: list[str],
     # pyre-ignore
     prune_configs_by=None,
     # pyre-ignore
