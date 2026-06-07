@@ -7,6 +7,10 @@
 
 # pyre-strict
 
+import os
+
+os.environ.setdefault("TRITON_AUTOTUNE_USE_ENTROPY", "0")
+
 import unittest
 from typing import Optional
 
