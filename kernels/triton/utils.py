@@ -138,8 +138,7 @@ class TritonAutotuner(Autotuner):
             else f"{self.fn.__name__}"
         )
 
-    # pyre-ignore[2]
-    def prune_configs(self, kwargs) -> list[triton.Config]:
+    def prune_configs(self, kwargs: dict) -> list[triton.Config]:
         if is_dev_mode():
             return self.configs[:1]
         else:
