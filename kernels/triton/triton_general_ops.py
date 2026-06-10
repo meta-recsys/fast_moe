@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 
 # @manual=//triton:triton
@@ -114,7 +116,7 @@ def triton_index_transpose(
         output = torch.empty(M, N, dtype=input.dtype, device=input.device)
         stride_om, stride_on = output.stride()
 
-    def grid(META):
+    def grid(META: Mapping[str, int]) -> tuple[int]:
         return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
 
     _kernel_index_transpose[grid](
@@ -194,7 +196,7 @@ def triton_sum_dim1(x: torch.Tensor) -> torch.Tensor:
     # assert triton.next_power_of_2(K) == K
     output = torch.empty((M, K), dtype=x.dtype, device=x.device)
 
-    def grid(META):
+    def grid(META: Mapping[str, int]) -> tuple[int, int]:
         return (M, triton.cdiv(K, META["BLOCK_K"]))
 
     _kernel_sum_dim1[grid](
