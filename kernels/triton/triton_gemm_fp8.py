@@ -18,9 +18,9 @@ from mslk.gemm.triton.grouped_gemm import early_config_prune
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-TT_FP8_DTYPE = tl.float8e4nv
+TT_FP8_DTYPE: tl.dtype = tl.float8e4nv
 
-_NV_CONFIGS = [
+_NV_CONFIGS: list[triton.Config] = [
     triton.Config(
         {
             "BLOCK_SIZE_M": block_size_m,
