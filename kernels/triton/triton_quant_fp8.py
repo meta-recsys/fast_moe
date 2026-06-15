@@ -206,7 +206,7 @@ def _kernel_quantize_fp8_row(
 
 @jit
 def calculate_scale(
-    cur_max,
+    cur_max: torch.Tensor,
     MAX_FP8: tl.constexpr,
 ) -> torch.Tensor:
     a_scale = MAX_FP8 / cur_max
