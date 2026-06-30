@@ -5,7 +5,7 @@
 
 #!/usr/bin/env python3
 
-# pyre-unsafe
+# pyre-strict
 
 """
 Numerics test to verify parity between MoeBase and FastMoELayer modules.
@@ -15,11 +15,12 @@ when given the same input and identical frozen weights.
 """
 
 import unittest
+from typing import cast
 
 import hypothesis.strategies as st
 import torch
 from fast_moe.modules.fast_moe_module import FastMoELayer
-from fast_moe.modules.moe_base import Activations, MoeBase
+from fast_moe.modules.moe_base import Activations, Expert, MoeBase
 from hypothesis import given, settings, Verbosity
 
 
@@ -70,12 +71,11 @@ class TestMoEParity(unittest.TestCase):
 
         # Freeze weights in moe_base to be the same across all experts
         for expert in moe_base.experts:
+            expert = cast(Expert, expert)
             layers = [expert.fc1, expert.fc2]
 
             for layer in layers:
-                # pyre-ignore[16]
                 torch.nn.init.constant_(layer.weight, weight_value)
-                # pyre-ignore[16]
                 torch.nn.init.constant_(layer.bias, bias_value)
 
         # Freeze gate weights
