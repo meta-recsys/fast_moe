@@ -22,7 +22,7 @@ from fast_moe.kernels.triton.utils import triton_autotune
 
 
 def _get_transpose_configs() -> list[triton.Config]:
-    configs = []
+    configs: list[triton.Config] = []
     for BLOCK_N in [64, 128, 256]:
         for BLOCK_M in [64, 128, 256]:
             for num_warps in [8, 16]:
@@ -135,7 +135,7 @@ def triton_index_transpose(
 
 
 def _get_sum_dim1_configs() -> list[triton.Config]:
-    configs = []
+    configs: list[triton.Config] = []
     for BLOCK_K in [32, 64, 128, 256]:
         for num_warps in [4, 8, 16]:
             for num_stages in [1, 2, 3]:
