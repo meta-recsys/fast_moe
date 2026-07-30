@@ -45,17 +45,17 @@ def _get_transpose_configs() -> list[triton.Config]:
 def _kernel_index_transpose(
     IN,
     OUT,
-    M,
-    N,
-    AUTOTUNE_M,
-    AUTOTUNE_N,
+    M: int,
+    N: int,
+    AUTOTUNE_M: int,
+    AUTOTUNE_N: int,
     INDEX,
     HAS_INDEX: tl.constexpr,
-    stride_om,
-    stride_on,
+    stride_om: int,
+    stride_on: int,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-):
+) -> None:
     pid = tl.program_id(axis=0)
     grid_n = tl.cdiv(N, BLOCK_N)
 
@@ -157,13 +157,13 @@ def _get_sum_dim1_configs() -> list[triton.Config]:
 def _kernel_sum_dim1(
     a_ptr,
     out_ptr,
-    M,
-    N,
-    K,
-    stride_m,
-    stride_n,
+    M: int,
+    N: int,
+    K: int,
+    stride_m: int,
+    stride_n: int,
     BLOCK_K: tl.constexpr,
-):
+) -> None:
     m = tl.program_id(0)
     k_block = tl.program_id(1)
 
@@ -227,14 +227,14 @@ def _kernel_jagged_reduce_sum(
     seq_offsets,
     JaggedB,
     ReduceOut,
-    N,
-    K,
-    stride_bk,
-    stride_orb,
-    stride_orn,
+    N: int,
+    K: int,
+    stride_bk: int,
+    stride_orb: int,
+    stride_orn: int,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-):
+) -> None:
     off_b = tl.program_id(0)
     off_n = tl.program_id(1)
 
@@ -326,10 +326,10 @@ def _kernel_silu_backward(
     x_ptr,  # float*  : forward‑input tensor
     dy_ptr,  # float*  : upstream grad dY
     dx_ptr,  # float*  : output grad dX
-    N,
-    AUTOTUNE_N,
+    N: int,
+    AUTOTUNE_N: int,
     BLOCK_N: tl.constexpr,
-):
+) -> None:
     pid = tl.program_id(0)
     offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = offs < N
