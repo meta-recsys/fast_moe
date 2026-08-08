@@ -182,6 +182,7 @@ def _kernel_quantize_fp8_row(
         n_offset += BLOCK_SIZE
 
     # Scale and quantize.
+    # pyrefly: ignore [bad-argument-type]
     a_scale = calculate_scale(cur_max, MAX_FP8)
     tl.store(A_scale + pid, a_scale)
     n_offset = tl.arange(0, BLOCK_SIZE)
@@ -268,6 +269,7 @@ def _rowwise_quant_fp8_kernel(
 
         cur_col_max = tl.maximum(tl.max(tl.abs(w.to(tl.float32)), axis=1), cur_col_max)
 
+    # pyrefly: ignore [bad-argument-type]
     w_scale = calculate_scale(cur_col_max, MAX_FP8)
 
     tl.store(
