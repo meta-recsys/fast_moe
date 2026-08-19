@@ -127,7 +127,6 @@ class TritonAutotuner(Autotuner):
             logger.warning(f"Only keep first config for {fn} due to dev mode")
             del self.configs[1:]
         self.bench_time = -1
-        # pyrefly: ignore [bad-override]
         self.best_config: list[triton.Config] = []
 
     @property

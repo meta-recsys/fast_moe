@@ -93,12 +93,10 @@ def approx_sample_size(
     conf_int: float, marg_err: float, mean: float, std_dev: float
 ) -> int:
     q_val = 1.0 - (1.0 - conf_int) / 2
-    # pyrefly: ignore [missing-attribute]
     z_val = stats.norm.ppf(q=q_val)
     n_approx = int(((z_val * std_dev) / (marg_err * mean)) ** 2) + 1
     if n_approx == 1:
         return n_approx
-    # pyrefly: ignore [missing-attribute]
     t_val = stats.t.ppf(q=q_val, df=n_approx - 1)
     n_approx = int(((t_val * std_dev) / (marg_err * mean)) ** 2) + 1
     return n_approx
