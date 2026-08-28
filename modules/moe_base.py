@@ -5,7 +5,6 @@
 
 #!/usr/bin/env python3
 
-# pyre-strict
 
 from enum import Enum
 from typing import Callable, Dict

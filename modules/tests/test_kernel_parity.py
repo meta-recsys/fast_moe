@@ -5,7 +5,6 @@
 
 #!/usr/bin/env python3
 
-# pyre-unsafe
 
 """
 Numerics test to verify parity between PyTorch and Triton kernel implementations.

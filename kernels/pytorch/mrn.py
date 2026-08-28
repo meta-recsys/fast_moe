@@ -5,7 +5,6 @@
 
 #!/usr/bin/env fbpython
 
-# pyre-strict
 
 from dataclasses import dataclass
 from typing import List, NamedTuple, Optional, Tuple

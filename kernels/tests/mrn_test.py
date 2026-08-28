@@ -5,7 +5,6 @@
 
 # buck2 test -c fbcode.disable_re_tests=True @//mode/opt //fast_moe/kernels/tests:mrn_test -- --print-passing-details
 
-# pyre-unsafe
 import logging
 import unittest
 from typing import Callable, List, Optional, Tuple

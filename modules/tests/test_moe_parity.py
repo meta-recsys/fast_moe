@@ -5,7 +5,6 @@
 
 #!/usr/bin/env python3
 
-# pyre-strict
 
 """
 Numerics test to verify parity between MoeBase and FastMoELayer modules.

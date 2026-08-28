@@ -5,7 +5,6 @@
 
 #!/usr/bin/env python3
 
-# pyre-strict
 
 from __future__ import annotations
 
