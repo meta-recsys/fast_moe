@@ -207,7 +207,6 @@ class OrigSGMoEImpl(torch.nn.Module):
             torch.gather(top_values_flat, 0, threshold_positions_if_out), 1
         )
 
-        # pyrefly: ignore [bad-argument-type]
         normal = Normal(self.mean, self.std, validate_args=False)
         prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
         prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)
